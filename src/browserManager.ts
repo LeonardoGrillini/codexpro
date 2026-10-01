@@ -1,4 +1,4 @@
-import path from "node:path";
+import { createHash } from "node:crypto";
 import type { CodexProConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { CodexProError, PathGuard } from "./guard.js";
@@ -9,6 +9,21 @@ interface BrowserSession {
   context: any;
   pages: any[];
   activePage: number;
+}
+
+type PlaywrightLoader = () => Promise<any>;
+
+export interface BrowserScreenshot {
+  sessionId: string;
+  activeTab: number;
+  tabCount: number;
+  title: string;
+  url: string;
+  path: string;
+  mimeType: "image/png" | "image/jpeg";
+  bytes: number;
+  sha256: string;
+  data: string;
 }
 
 async function loadPlaywright(): Promise<any> {
@@ -36,7 +51,11 @@ function pageFor(session: BrowserSession): any {
 
 export class BrowserManager {
   private readonly sessions = new Map<string, BrowserSession>();
-  constructor(private readonly config: CodexProConfig, private readonly guard: PathGuard) {}
+  constructor(
+    private readonly config: CodexProConfig,
+    private readonly guard: PathGuard,
+    private readonly playwrightLoader: PlaywrightLoader = loadPlaywright
+  ) {}
 
   private assertEnabled(): void {
     if (!this.config.browserEnabled) throw new CodexProError("browser tools are disabled; set CODEXPRO_BROWSER_ENABLED=1 to enable them");
@@ -46,7 +65,7 @@ export class BrowserManager {
     this.assertEnabled();
     const resolvedId = sessionId(id);
     if (this.sessions.has(resolvedId)) throw new CodexProError(`browser session already exists: ${resolvedId}`);
-    const { chromium } = await loadPlaywright();
+    const { chromium } = await this.playwrightLoader();
     const browser = await chromium.launch({ headless: true });
     const context = await browser.newContext();
     const page = await context.newPage();
@@ -124,12 +143,25 @@ export class BrowserManager {
     return { ...(await this.describe(session)), tabs: await Promise.all(session.pages.map(async (page, i) => ({ index: i, title: await page.title(), url: page.url() }))) };
   }
 
-  async screenshot(id: string, workspace: Workspace, outputPath: string, fullPage = true): Promise<Record<string, unknown>> {
+  async screenshot(id: string, workspace: Workspace, outputPath: string, fullPage = true): Promise<BrowserScreenshot> {
     const session = this.get(id); const page = pageFor(session);
     const resolved = this.guard.resolve(workspace, outputPath, { forWrite: true });
     if (!/\.(?:png|jpe?g)$/i.test(resolved.relPath)) throw new CodexProError("screenshot output path must end in .png, .jpg, or .jpeg");
-    await page.screenshot({ path: resolved.absPath, fullPage });
-    return { ...(await this.describe(session)), path: resolved.relPath };
+    const mimeType = /\.png$/i.test(resolved.relPath) ? "image/png" : "image/jpeg";
+    const buffer = Buffer.from(await page.screenshot({ path: resolved.absPath, fullPage }));
+    const details = await this.describe(session);
+    return {
+      sessionId: String(details.sessionId),
+      activeTab: Number(details.activeTab),
+      tabCount: Number(details.tabCount),
+      title: String(details.title),
+      url: String(details.url),
+      path: resolved.relPath,
+      mimeType,
+      bytes: buffer.byteLength,
+      sha256: createHash("sha256").update(buffer).digest("hex"),
+      data: buffer.toString("base64")
+    };
   }
 
   async close(id: string): Promise<void> {

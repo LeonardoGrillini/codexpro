@@ -29,6 +29,8 @@ try {
   const fullWithoutKey = toolNamesForMode({ ...config, toolMode: 'full' });
   assert.equal(fullWithoutKey.some((name) => name.startsWith('subagent_')), false, 'no key must remove all subagent tools');
   assert.equal(fullWithoutKey.includes('git'), true, 'ordinary structured git remains available without DeepSeek');
+  const standardWithBrowser = toolNamesForMode({ ...config, toolMode: 'standard', browserEnabled: true });
+  assert.equal(standardWithBrowser.includes('browser'), true, 'enabled browser must be available in standard tool mode');
 
   const workspace = { id: 'test', root: tmp, openedAt: new Date().toISOString() };
   const guard = new PathGuard(config);
@@ -79,6 +81,37 @@ try {
 
   const browser = new BrowserManager(config, guard);
   await assert.rejects(() => browser.open('disabled'), /browser tools are disabled/i);
+
+  const screenshotBytes = Buffer.from('browser-screenshot-smoke');
+  const fakePage = {
+    async title() { return 'Fake page'; },
+    url() { return 'https://example.invalid/'; },
+    async screenshot(options) {
+      await fs.mkdir(path.dirname(options.path), { recursive: true });
+      await fs.writeFile(options.path, screenshotBytes);
+      return screenshotBytes;
+    }
+  };
+  const fakeContext = {
+    async newPage() { return fakePage; },
+    async close() {}
+  };
+  const fakeBrowser = {
+    async newContext() { return fakeContext; },
+    async close() {}
+  };
+  const enabledBrowser = new BrowserManager(
+    { ...config, browserEnabled: true },
+    guard,
+    async () => ({ chromium: { async launch() { return fakeBrowser; } } })
+  );
+  await enabledBrowser.open('capture');
+  const screenshot = await enabledBrowser.screenshot('capture', workspace, '.ai-bridge/browser-smoke.png');
+  assert.equal(screenshot.mimeType, 'image/png');
+  assert.equal(screenshot.data, screenshotBytes.toString('base64'));
+  assert.equal(screenshot.bytes, screenshotBytes.byteLength);
+  assert.equal(await fs.readFile(path.join(tmp, screenshot.path), 'utf8'), screenshotBytes.toString('utf8'));
+  await enabledBrowser.closeAll();
 
   const gitVersion = spawnSync('git', ['--version'], { encoding: 'utf8' });
   if (gitVersion.status === 0) {

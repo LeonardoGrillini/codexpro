@@ -63,6 +63,42 @@ try {
     assert.doesNotMatch(largeRead.content[0].text, /\uFFFD/, 'UTF-8 truncation must not split a character');
     const missing = await client.callTool({ name: 'read', arguments: { path: 'missing.txt' } });
     assert.equal(missing.isError, true, 'response limiting must preserve tool errors');
+
+    const screenshotPayload = Buffer.from('native-browser-image');
+    const screenshotData = screenshotPayload.toString('base64');
+    const fakeBrowserManager = {
+      async screenshot() {
+        return {
+          sessionId: 'native-image', activeTab: 0, tabCount: 1, title: 'Screenshot fixture',
+          url: 'https://example.invalid/', path: '.ai-bridge/native-browser.png', mimeType: 'image/png',
+          bytes: screenshotPayload.byteLength, sha256: '0'.repeat(64), data: screenshotData
+        };
+      }
+    };
+    const browserConfig = { ...config, browserEnabled: true, toolMode: 'standard' };
+    const browserServer = createCodexProServer(browserConfig, new Map(), { browserManager: fakeBrowserManager });
+    const browserClient = new Client({ name: 'browser-result-smoke', version: '1' });
+    const [browserTransport, browserClientTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await browserServer.connect(browserTransport);
+      await browserClient.connect(browserClientTransport);
+      const tools = await browserClient.listTools();
+      assert.equal(tools.tools.some((tool) => tool.name === 'browser'), true, 'standard mode must expose enabled browser');
+      const result = await browserClient.callTool({
+        name: 'browser',
+        arguments: { action: 'screenshot', session_id: 'native-image', output_path: '.ai-bridge/native-browser.png' }
+      });
+      assert.notEqual(result.isError, true);
+      const image = result.content.find((block) => block.type === 'image');
+      assert.ok(image, 'browser screenshot must return native MCP image content');
+      assert.equal(image.mimeType, 'image/png');
+      assert.equal(image.data, screenshotData);
+      assert.equal(result.structuredContent.result.data, undefined, 'base64 image data must not be duplicated into structured content');
+      assert.equal(result.structuredContent.result.path, '.ai-bridge/native-browser.png');
+    } finally {
+      await browserClient.close();
+      await browserServer.close();
+    }
   } finally {
     await client.close();
     await server.close();

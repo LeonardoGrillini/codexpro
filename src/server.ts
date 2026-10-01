@@ -408,7 +408,8 @@ const STANDARD_TOOL_NAMES = [
   "export_pro_context",
   "handoff_to_agent",
   "git",
-  "vm"
+  "vm",
+  "browser"
 ] as const;
 
 const FULL_TOOL_NAMES = [
@@ -1075,14 +1076,22 @@ const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, des
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
-export function createCodexProServer(config: CodexProConfig, knownWorkspaceRoots = new Map<string, string>()): McpServer {
+export interface CodexProServerDependencies {
+  browserManager?: BrowserManager;
+}
+
+export function createCodexProServer(
+  config: CodexProConfig,
+  knownWorkspaceRoots = new Map<string, string>(),
+  dependencies: CodexProServerDependencies = {}
+): McpServer {
   const workspaces = new WorkspaceManager(config, knownWorkspaceRoots);
   const outputs = new OutputStore();
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);
   const gitService = new GitService(config, guard);
   const worktreeManager = new WorktreeManager(config);
-  const browserManager = new BrowserManager(config, guard);
+  const browserManager = dependencies.browserManager ?? new BrowserManager(config, guard);
   const vmManager = new VmManager();
   const agentManager = config.subagentsEnabled && config.deepseekApiKey
     ? new AgentManager(config, guard, new DeepSeekBackend(config.deepseekApiKey))
@@ -2478,7 +2487,7 @@ export function createCodexProServer(config: CodexProConfig, knownWorkspaceRoots
     "browser",
     {
       title: "Browser",
-      description: "Operate an isolated Playwright Chromium session. Browser state is isolated per session and credentials/cookies are never inherited automatically.",
+      description: "Operate an isolated Playwright Chromium session. Browser state is isolated per session and credentials/cookies are never inherited automatically. The screenshot action returns native MCP image content and also saves the image in the workspace.",
       inputSchema: {
         workspace_id: z.string().optional(), action: z.enum(["open", "navigate", "snapshot", "click", "type", "select", "scroll", "wait", "tab", "screenshot", "close", "list"]),
         session_id: z.string().optional(), url: z.string().optional(), selector: z.string().optional(), text: z.string().optional(), submit: z.boolean().optional(), values: z.array(z.string()).optional(),
@@ -2499,7 +2508,25 @@ export function createCodexProServer(config: CodexProConfig, knownWorkspaceRoots
         case "scroll": result = await browserManager.scroll(id, Number(args.x ?? 0), Number(args.y ?? 600)); break;
         case "wait": result = await browserManager.wait(id, args.selector, args.timeout_ms); break;
         case "tab": result = await browserManager.tab(id, args.tab_action ?? "list", args.index); break;
-        case "screenshot": result = await browserManager.screenshot(id, workspace, String(args.output_path ?? `${config.contextDir}/browser-${Date.now()}.png`), parseBool(args.full_page, true)); break;
+        case "screenshot": {
+          const screenshot = await browserManager.screenshot(
+            id,
+            workspace,
+            String(args.output_path ?? `${config.contextDir}/browser-${Date.now()}.png`),
+            parseBool(args.full_page, true)
+          );
+          const { data, mimeType, ...details } = screenshot;
+          return {
+            content: [
+              {
+                type: "text",
+                text: redactSensitiveText(`# Browser screenshot\n\n${JSON.stringify(details, null, 2)}`)
+              },
+              { type: "image", data, mimeType }
+            ],
+            structuredContent: redactStructured({ workspace_id: workspace.id, action, result: details })
+          };
+        }
         case "close": await browserManager.close(id); result = { closed: id }; break;
         case "list": result = { sessions: browserManager.list() }; break;
         default: throw new CodexProError(`Unsupported browser action: ${action}`);

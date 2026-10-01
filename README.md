@@ -193,7 +193,7 @@ The `git` tool provides structured status, branch, log, show, blame, staging, co
 
 `CODEXPRO_BASH_MODE=safe` is a productive local command mode rather than a small command allowlist. Normal package managers, compilers, test runners, scripts, and command chains can run, while obviously catastrophic filesystem, disk, system, and destructive Git operations are rejected. `full` remains an explicit trusted-repository override. Commands run with bounded output, timeout handling, a controlled environment by default, and separate stdout/stderr results.
 
-Browser automation is opt-in with `CODEXPRO_BROWSER_ENABLED=1`. It uses Playwright Chromium with one isolated browser context per CodexPro browser session, supports navigation, semantic snapshots, interaction, tabs, waits, and screenshots, and does not inherit credentials/cookies across sessions. Install the optional runtime before enabling it:
+Browser automation is opt-in with `CODEXPRO_BROWSER_ENABLED=1`. When enabled it is available in standard tool mode. It uses Playwright Chromium with one isolated browser context per CodexPro browser session, supports navigation, semantic snapshots, interaction, tabs, waits, and screenshots, and does not inherit credentials/cookies across sessions. Screenshot actions both save the image inside the allowed workspace and return native MCP image content so the AI can inspect the rendered page directly. Install the optional runtime before enabling it:
 
 ```bash
 npm install playwright
