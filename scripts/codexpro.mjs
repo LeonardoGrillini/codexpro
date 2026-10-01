@@ -745,11 +745,13 @@ function saveRuntimeConnection(root, details, options = {}) {
     root,
     pid: process.pid,
     runtimePid: options.runtimePid ?? null,
+    tunnelPid: options.tunnelPid ?? null,
     updatedAt: new Date().toISOString(),
     endpoint: details.endpoint,
     localBase: options.localBase ?? '',
     localStatusUrl: details.localStatusUrl ? details.localStatusUrl.replace(/codexpro_token=[^&]+/, 'codexpro_token=<redacted>') : '',
     tunnel: options.tunnel ?? '',
+    hostname: options.hostname ?? '',
     mode: options.mode ?? '',
     bash: options.bash ?? '',
     bashTranscript: options.bashTranscript ?? '',
@@ -773,6 +775,59 @@ function clearRuntimeConnection(root) {
     const runtime = readJsonFile(filePath);
     if (runtime?.pid === process.pid) fs.rmSync(filePath, { force: true });
   } catch {}
+}
+
+function processAlive(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) return false;
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch (error) {
+    return Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'EPERM');
+  }
+}
+
+function runtimeHostname(runtime) {
+  if (runtime?.hostname) return normalizePublicHostname(runtime.hostname);
+  if (!runtime?.endpoint) return '';
+  try {
+    return normalizePublicHostname(new URL(runtime.endpoint).hostname);
+  } catch {
+    return '';
+  }
+}
+
+async function localRuntimeResponds(localBase) {
+  try {
+    const response = await fetch(`${localBase}/healthz`);
+    return response.ok || response.status === 401 || response.status === 403;
+  } catch {
+    return false;
+  }
+}
+
+async function findReusableRuntime(root, expected) {
+  const filePath = runtimeStatusPathForRoot(root);
+  const runtime = readJsonFile(filePath);
+  if (!runtime?.pid) return null;
+  if (!processAlive(runtime.pid)) {
+    fs.rmSync(filePath, { force: true });
+    return null;
+  }
+  const mismatches = [];
+  if (runtime.root && runtime.root !== root) mismatches.push(`root=${runtime.root}`);
+  if (runtime.localBase && runtime.localBase !== expected.localBase) mismatches.push(`local=${runtime.localBase}`);
+  if (runtime.tunnel && runtime.tunnel !== expected.tunnel) mismatches.push(`tunnel=${runtime.tunnel}`);
+  const activeHostname = runtimeHostname(runtime);
+  if (expected.hostname && activeHostname && activeHostname !== expected.hostname) mismatches.push(`hostname=${activeHostname}`);
+  if (mismatches.length) {
+    throw new Error(`A live CodexPro runtime already owns this workspace (PID ${runtime.pid}) but does not match this launch: ${mismatches.join(', ')}. Stop it before changing the port, tunnel, or hostname.`);
+  }
+  if (!await localRuntimeResponds(expected.localBase)) {
+    throw new Error(`A live CodexPro launcher (PID ${runtime.pid}) owns this workspace, but its local HTTP runtime is not responding. Stop that launcher before starting another one.`);
+  }
+  return runtime;
 }
 
 function sanitizedProfile(profile) {
@@ -3034,11 +3089,20 @@ async function runDoctor(argv) {
   record(clipboard ? 'ok' : 'warn', 'Clipboard', clipboard || 'not found; URL will be printed for manual copy');
   record(browser ? 'ok' : 'warn', 'Browser open', browser || 'not found; open ChatGPT manually');
 
-  try {
-    await assertPortAvailable(host, port);
-    record('ok', 'Local port', `${host}:${port} available`);
-  } catch (error) {
-    record('fail', 'Local port', error instanceof Error ? error.message.split('\n')[0] : String(error));
+  const activeRuntime = readJsonFile(runtimeStatusPathForRoot(root));
+  const configuredLocalBase = `http://${host}:${port}`;
+  const runtimeLive = processAlive(activeRuntime?.pid) && await localRuntimeResponds(activeRuntime.localBase || configuredLocalBase);
+  if (runtimeLive) {
+    record('ok', 'Runtime owner', `launcher=${activeRuntime.pid}; http=${activeRuntime.runtimePid ?? 'unknown'}; tunnel=${activeRuntime.tunnelPid ?? 'unknown'}; endpoint=${runtimeHostname(activeRuntime) || activeRuntime.localBase || configuredLocalBase}`);
+    record('ok', 'Local port', `${host}:${port} owned by active CodexPro runtime`);
+  } else {
+    record(activeRuntime?.pid ? 'warn' : 'ok', 'Runtime owner', activeRuntime?.pid ? `stale runtime record for launcher ${activeRuntime.pid}` : 'no active runtime');
+    try {
+      await assertPortAvailable(host, port);
+      record('ok', 'Local port', `${host}:${port} available`);
+    } catch (error) {
+      record('fail', 'Local port', error instanceof Error ? error.message.split('\n')[0] : String(error));
+    }
   }
 
   if (tunnel === 'none') {
@@ -4031,6 +4095,16 @@ async function main() {
     throw new Error(`Missing ${httpPath}. Run npm install && npm run build first.`);
   }
 
+  const localBase = `http://${host}:${port}`;
+  const reusableRuntime = await findReusableRuntime(root, {
+    localBase,
+    tunnel,
+    hostname: stableHostname
+  });
+  if (reusableRuntime) {
+    statusLine('ok', `Reusing existing CodexPro runtime (launcher PID ${reusableRuntime.pid}, HTTP PID ${reusableRuntime.runtimePid ?? 'unknown'})`);
+    return;
+  }
   await assertPortAvailable(host, port);
 
   printBox('CodexPro start', [
@@ -4068,12 +4142,12 @@ async function main() {
   process.on('SIGINT', () => { cleanup(); process.exit(130); });
   process.on('SIGTERM', () => { cleanup(); process.exit(143); });
 
-  const localBase = `http://${host}:${port}`;
   await waitForHealth(`${localBase}/healthz`, token);
   statusLine('ok', `Local MCP ready at ${localBase}/mcp`);
   const runtimeOptions = {
     localBase,
     tunnel,
+    hostname: stableHostname,
     mode,
     toolMode,
     write,
@@ -4084,6 +4158,7 @@ async function main() {
     requireBashSession,
     toolCards,
     connectionTest,
+    tunnelPid: null,
     runtimePid: server.pid ?? null
   };
 
@@ -4121,6 +4196,7 @@ async function main() {
     if (configPath) ngrokArgs.push('--config', configPath);
     statusLine('wait', `Opening ngrok endpoint for ${publicBase}`);
     cloudflared = spawnLogged('ngrok', ngrokPath, ngrokArgs, { cwd: root, env: process.env, verbose: verboseLogs });
+    runtimeOptions.tunnelPid = cloudflared.pid ?? null;
     try {
       await waitForPublicHealth(publicBase, token, cloudflared, 'ngrok');
     } catch (error) {

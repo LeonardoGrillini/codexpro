@@ -25,6 +25,7 @@ import { BrowserManager } from "./browserManager.js";
 import { DeepSeekBackend } from "./deepseekBackend.js";
 import { AgentManager } from "./agentManager.js";
 import { VmManager, runVmToolAction } from "./vm/index.js";
+import { CODEXPRO_VERSION } from "./version.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -1096,7 +1097,7 @@ export function createCodexProServer(
   const agentManager = config.subagentsEnabled && config.deepseekApiKey
     ? new AgentManager(config, guard, new DeepSeekBackend(config.deepseekApiKey))
     : undefined;
-  const server = new McpServer({ name: "CodexPro", version: "0.30.0" }, { instructions: serverInstructions(config) });
+  const server = new McpServer({ name: "CodexPro", version: CODEXPRO_VERSION }, { instructions: serverInstructions(config) });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);
 
