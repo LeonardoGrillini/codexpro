@@ -16,6 +16,7 @@ import {
   verifyCloudflaredAsset
 } from './cloudflared-release.mjs';
 
+import { requestChatgptBrowserOpen } from './chatgpt-browser-control.mjs';
 import { runVmCli } from './vm-cli.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -78,6 +79,12 @@ Options:
   --host <host>             Local bind host. Default: 127.0.0.1.
   --port <port>             Local port. Default: 8787.
   --bash <off|safe|full>    Bash mode. Default: safe.
+  --subagent-provider <chatgpt-browser|deepseek|off>
+                             Select the subagent backend.
+  --chatgpt-browser-auto-start
+                             Start the dedicated visible ChatGPT Chrome profile with CodexPro.
+  --no-chatgpt-browser-auto-start
+                             Keep the ChatGPT browser manual; press b in the terminal to open it.
   --no-bash                 Shortcut for --bash off.
   --bash-transcript <compact|full>
   --shell <auto|powershell|cmd|bash|wsl> Command shell (auto: PowerShell on Windows, Bash elsewhere).
@@ -351,6 +358,8 @@ function parseArgs(argv) {
     else if (key === 'allow-implicit-review-verdict') out.allowImplicitReviewVerdict = true;
     else if (key === 'allow-review-pass-on-failure') out.allowReviewPassOnFailure = true;
     else if (key === 'open-chatgpt') out.openChatgpt = true;
+    else if (key === 'chatgpt-browser-auto-start') out.chatgptBrowserAutoStart = true;
+    else if (key === 'no-chatgpt-browser-auto-start') out.chatgptBrowserAutoStart = false;
     else if (key === 'headless') out.headless = true;
     else if (key === 'no-profile') out.noProfile = true;
     else if (key === 'clear-projects') out.clearProjects = true;
@@ -2933,7 +2942,7 @@ function printConnectorBlock(endpoint, token, options = {}) {
     console.log(`CODEXPRO_READY ${serverUrl}`);
   } else {
     console.log('Next: press Enter to open ChatGPT, paste the copied Server URL, choose Authentication: None.');
-    console.log('Keys: Enter open | c copy | o status | h help | q quit');
+    console.log('Keys: Enter connector | b ChatGPT browser | c copy | o status | h help | q quit');
   }
   return { ...details, copied, opened, mode, toolMode: options.toolMode ?? 'standard' };
 }
@@ -2942,6 +2951,7 @@ function printControlHelp() {
   console.log('');
   console.log('Controls');
   console.log('  Enter  open ChatGPT connector settings in your browser');
+  console.log('  b      open/focus the dedicated ChatGPT subagent browser');
   console.log('  c      copy Server URL again');
   console.log('  u      print Server URL only');
   console.log('  o      open local setup/status page');
@@ -3252,6 +3262,8 @@ function profileFromPreference(root, args, profile, preference) {
   const { bashSession, requireBashSession } = bashSessionOptions(args, profile);
   const write = optionalWriteOption(args, profile, mode);
   const toolMode = optionValue(args, profile, 'toolMode', ['CODEXPRO_TOOL_MODE'], '');
+  const subagentProvider = optionValue(args, profile, 'subagentProvider', ['CODEXPRO_SUBAGENT_PROVIDER'], '');
+  const chatgptBrowserAutoStart = optionBool(args, profile, 'chatgptBrowserAutoStart', ['CODEXPRO_CHATGPT_BROWSER_AUTO_START'], false);
   const widgetDomain = optionValue(args, profile, 'widgetDomain', ['CODEXPRO_WIDGET_DOMAIN'], '');
   const existingToken = optionValue(args, profile, 'token', ['CODEXPRO_HTTP_TOKEN', 'CODEBASE_BRIDGE_HTTP_TOKEN'], '');
   const token = preference.tunnel === 'none' ? existingToken : stableToken(existingToken);
@@ -3275,6 +3287,8 @@ function profileFromPreference(root, args, profile, preference) {
     ...(requireBashSession ? { requireBashSession: true } : {}),
     ...(write ? { write } : {}),
     ...(toolMode ? { toolMode } : {}),
+    ...(subagentProvider ? { subagentProvider } : {}),
+    ...(subagentProvider === 'chatgpt-browser' || args.chatgptBrowserAutoStart !== undefined || profile.chatgptBrowserAutoStart !== undefined ? { chatgptBrowserAutoStart } : {}),
     ...(widgetDomain ? { widgetDomain } : {}),
     ...toolCardsProfileEntry(args, profile),
     ...(allowedRoots.length ? { allowedRoots } : {}),
@@ -3379,6 +3393,18 @@ async function runSetupWizard(argv) {
     const port = normalizePort(await ask(rl, 'Which local port should CodexPro use?', defaultPort));
     const modeAnswer = await ask(rl, 'Mode: agent, handoff, or pro?', defaultMode);
     const mode = normalizeSetupChoice(modeAnswer, ['agent', 'handoff', 'pro'], defaultMode);
+    const defaultSubagentProvider = normalizeSetupChoice(
+      optionValue(defaults, profile, 'subagentProvider', ['CODEXPRO_SUBAGENT_PROVIDER'], process.env.DEEPSEEK_API_KEY?.trim() ? 'deepseek' : 'chatgpt-browser'),
+      ['chatgpt-browser', 'deepseek', 'off'],
+      process.env.DEEPSEEK_API_KEY?.trim() ? 'deepseek' : 'chatgpt-browser'
+    );
+    const providerAnswer = await ask(rl, 'Subagent provider: chatgpt-browser, deepseek, or off?', defaultSubagentProvider);
+    const subagentProvider = normalizeSetupChoice(providerAnswer, ['chatgpt-browser', 'deepseek', 'off'], defaultSubagentProvider);
+    const autoStartDefault = optionBool(defaults, profile, 'chatgptBrowserAutoStart', ['CODEXPRO_CHATGPT_BROWSER_AUTO_START'], true);
+    const autoStartAnswer = subagentProvider === 'chatgpt-browser'
+      ? await ask(rl, 'Start the CodexPro ChatGPT browser automatically when CodexPro starts?', autoStartDefault ? 'yes' : 'no')
+      : 'no';
+    const chatgptBrowserAutoStart = subagentProvider === 'chatgpt-browser' && !['n', 'no'].includes(autoStartAnswer.trim().toLowerCase());
 
     printBox('Public URL', [
       'ChatGPT needs an HTTPS URL it can reach.',
@@ -3391,7 +3417,8 @@ async function runSetupWizard(argv) {
 
     const tunnelAnswer = await ask(rl, 'Public access: quick, stable, ngrok, tailscale, or local?', defaultTunnel);
     const tunnelChoice = normalizeSetupChoice(tunnelAnswer, ['quick', 'stable', 'ngrok', 'tailscale', 'local'], defaultTunnel);
-    const args = ['start', '--root', root, '--port', port, '--mode', mode];
+    const args = ['start', '--root', root, '--port', port, '--mode', mode, '--subagent-provider', subagentProvider];
+    args.push(chatgptBrowserAutoStart ? '--chatgpt-browser-auto-start' : '--no-chatgpt-browser-auto-start');
     const shell = shellSettings(defaults, profile);
     args.push('--shell', shell.shell);
     if (shell.wslDistribution) args.push('--wsl-distribution', shell.wslDistribution);
@@ -3507,6 +3534,8 @@ async function runSetupWizard(argv) {
         ...(requireBashSession ? { requireBashSession: true } : {}),
         ...(write ? { write } : {}),
         ...(toolMode ? { toolMode } : {}),
+        subagentProvider,
+        chatgptBrowserAutoStart,
         ...(widgetDomain ? { widgetDomain } : {}),
         ...toolCardsEntry,
         ...(allowedRoots.length ? { allowedRoots } : {}),
@@ -3557,6 +3586,8 @@ function printProfile(root, profile) {
     ...(safe.wslDistribution ? [labelValue('WSL distribution', safe.wslDistribution)] : []),
     ...(safe.write ? [labelValue('Write', safe.write)] : []),
     ...(safe.toolMode ? [labelValue('Tool mode', safe.toolMode)] : []),
+    ...(safe.subagentProvider ? [labelValue('Subagents', safe.subagentProvider)] : []),
+    ...(safe.chatgptBrowserAutoStart !== undefined ? [labelValue('ChatGPT browser', safe.chatgptBrowserAutoStart ? 'auto-start' : 'manual')] : []),
     ...(safe.toolCards !== undefined ? [labelValue('Tool cards', safe.toolCards ? 'on' : 'off')] : []),
     labelValue('Bash transcript', safe.bashTranscript ?? 'compact'),
     labelValue('Codex sessions', safe.codexSessions ?? 'off'),
@@ -3602,6 +3633,8 @@ function saveSettingsFromArgs(root, args, profile) {
     throw new Error('--mode must be agent, handoff, or pro');
   }
   const toolMode = optionalChoice('tool-mode', optionValue(args, profile, 'toolMode', ['CODEXPRO_TOOL_MODE'], profile.toolMode ?? ''), ['minimal', 'standard', 'full']);
+  const subagentProvider = optionalChoice('subagent-provider', optionValue(args, profile, 'subagentProvider', ['CODEXPRO_SUBAGENT_PROVIDER'], profile.subagentProvider ?? ''), ['chatgpt-browser', 'deepseek', 'off']);
+  const chatgptBrowserAutoStart = optionBool(args, profile, 'chatgptBrowserAutoStart', ['CODEXPRO_CHATGPT_BROWSER_AUTO_START'], false);
   const widgetDomain = optionValue(args, profile, 'widgetDomain', ['CODEXPRO_WIDGET_DOMAIN'], profile.widgetDomain ?? '');
   const port = normalizePort(optionValue(args, profile, 'port', ['CODEXPRO_PORT'], profile.port ?? '8787'));
   const bashTranscript = bashTranscriptOption(args, profile);
@@ -3643,6 +3676,8 @@ function saveSettingsFromArgs(root, args, profile) {
     ...(requireBashSession ? { requireBashSession: true } : {}),
     ...(mode !== 'agent' || args.write !== undefined || profile.write ? { write } : {}),
     ...(toolMode ? { toolMode } : {}),
+    ...(subagentProvider ? { subagentProvider } : {}),
+    ...(subagentProvider === 'chatgpt-browser' || args.chatgptBrowserAutoStart !== undefined || profile.chatgptBrowserAutoStart !== undefined ? { chatgptBrowserAutoStart } : {}),
     ...(widgetDomain ? { widgetDomain } : {}),
     ...toolCardsProfileEntry(args, profile),
     ...(allowedRoots.length ? { allowedRoots } : {}),
@@ -3834,6 +3869,15 @@ function runControlPanel(details, cleanup = cleanupChildren) {
         const opened = openUrl(details.chatgptSettingsUrl);
         console.log(opened ? '\nOpened ChatGPT connector settings. The Server URL is already copied; paste it into Server URL.' : '\nCould not open ChatGPT automatically.');
         writeControlPrompt();
+      } else if (normalized === 'b') {
+        console.log('\nOpening ChatGPT browser...');
+        void requestChatgptBrowserOpen(details).then((result) => {
+          console.log(result?.url ? `ChatGPT browser ready: ${result.url}` : 'ChatGPT browser ready.');
+          writeControlPrompt();
+        }).catch((error) => {
+          console.log(`Could not open the ChatGPT browser: ${error instanceof Error ? error.message : String(error)}`);
+          writeControlPrompt();
+        });
       } else if (normalized === 'c') {
         const copied = copyToClipboard(details.serverUrl);
         console.log(copied.ok ? `\nServer URL copied with ${copied.command}.` : '\nCould not copy automatically.');
@@ -4044,11 +4088,14 @@ async function main() {
   const { bashSession, requireBashSession } = bashSessionOptions(args, profile);
   const write = writeOption(args, profile, mode);
   const toolMode = optionValue(args, profile, 'toolMode', ['CODEXPRO_TOOL_MODE'], 'standard');
+  const subagentProvider = optionValue(args, profile, 'subagentProvider', ['CODEXPRO_SUBAGENT_PROVIDER'], process.env.DEEPSEEK_API_KEY?.trim() ? 'deepseek' : 'off');
+  const chatgptBrowserAutoStart = optionBool(args, profile, 'chatgptBrowserAutoStart', ['CODEXPRO_CHATGPT_BROWSER_AUTO_START'], false);
   const widgetDomain = optionValue(args, profile, 'widgetDomain', ['CODEXPRO_WIDGET_DOMAIN'], 'https://rebel0789.github.io');
   const toolCards = optionBool(args, profile, 'toolCards', ['CODEXPRO_TOOL_CARDS'], false);
   validateChoice('bash', bash, ['off', 'safe', 'full']);
   validateChoice('write', write, ['off', 'handoff', 'workspace']);
   validateChoice('tool-mode', toolMode, ['minimal', 'standard', 'full']);
+  validateChoice('subagent-provider', subagentProvider, ['chatgpt-browser', 'deepseek', 'off']);
 
   if (args.token && args.tokenFile) throw new Error('Use either --token or --token-file, not both.');
   let token = args.noAuth
@@ -4073,6 +4120,9 @@ async function main() {
     CODEXPRO_CODEX_SESSIONS: codexSessions,
     CODEXPRO_WRITE_MODE: write,
     CODEXPRO_TOOL_MODE: toolMode,
+    CODEXPRO_SUBAGENT_PROVIDER: subagentProvider,
+    CODEXPRO_SUBAGENTS_ENABLED: subagentProvider === 'off' ? '0' : '1',
+    CODEXPRO_CHATGPT_BROWSER_AUTO_START: chatgptBrowserAutoStart ? '1' : '0',
     CODEXPRO_WIDGET_DOMAIN: widgetDomain,
     CODEXPRO_TOOL_CARDS: toolCards ? '1' : '0',
     CODEXPRO_CONNECTION_TEST: connectionTest ? '1' : '0',

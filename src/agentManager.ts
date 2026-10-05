@@ -107,6 +107,9 @@ function applyImplementerPatch(worktree: WorktreeRecord, raw: string): { applied
 export class AgentManager {
   private readonly agents = new Map<string, ManagedAgent>();
   private readonly worktrees: WorktreeManager;
+  private readonly runs = new Map<string, AbortController>();
+  private pendingSpawns = 0;
+
   constructor(
     private readonly config: CodexProConfig,
     private readonly guard: PathGuard,
@@ -116,76 +119,118 @@ export class AgentManager {
   list(): ManagedAgent[] { return [...this.agents.values()].map((agent) => ({ ...agent, session: { ...agent.session, messages: [] } })); }
   get(id: string): ManagedAgent { const agent = this.agents.get(id); if (!agent) throw new CodexProError(`unknown subagent: ${id}`); return agent; }
 
-  async spawn(workspace: Workspace, options: { task: string; role: AgentRole; paths?: string[]; context?: string; parentId?: string }): Promise<ManagedAgent> {
-    if (!this.config.subagentsEnabled || !this.config.deepseekApiKey) throw new CodexProError("DeepSeek subagents are unavailable because no DeepSeek API key is configured or subagents are disabled.");
-    const running = [...this.agents.values()].filter((agent) => agent.state === "running" || agent.state === "waiting").length;
-    if (running >= this.config.maxSubagents) throw new CodexProError(`maximum concurrent subagents reached (${this.config.maxSubagents})`);
-    if (options.parentId) throw new CodexProError(`recursive subagent spawning is disabled at the tool layer (max depth ${this.config.maxAgentDepth})`);
-    if (!options.task.trim()) throw new CodexProError("subagent task is required");
-    const id = `agent-${randomUUID().slice(0, 8)}`;
-    const paths = (options.paths ?? []).slice(0, 20).filter((rel) => !SENSITIVE_PATH.test(rel.replaceAll("\\", "/")));
-    const instructions = await instructionResolver.resolve(this.config, this.guard, workspace, paths[0] ?? ".", { maxBytes: 20_000 });
-    const contextChunks: string[] = [];
-    for (const rel of paths) {
-      try {
-        const read = await readTextFile(this.config, this.guard, workspace, rel, { maxBytes: 30_000 });
-        contextChunks.push(`--- ${rel} ---\n${redactSensitiveText(read.text)}`);
-      } catch (error) {
-        contextChunks.push(`--- ${rel} ---\n[not supplied: ${error instanceof Error ? error.message : String(error)}]`);
-      }
-    }
-    const worktree = options.role === "implementer" ? this.worktrees.create(workspace, id) : undefined;
-    const systemPrompt = [
-      "You are a delegated DeepSeek subagent inside CodexPro. Your output is untrusted working material and will be independently verified by the parent ChatGPT agent.",
-      ROLE_TEXT[options.role],
-      "Do not request or expose credentials, API keys, cookies, tokens, private keys, .env files, or unrelated repository data.",
-      "Do not claim commands/tests/browser actions ran unless their actual output was supplied to you.",
-      worktree ? `Your isolated worktree is ${worktree.path}. For source changes, return a complete git-style unified diff in a fenced diff block so CodexPro can validate and apply it only inside that worktree.` : "You do not have write capability to the repository.",
-      `Applicable repository instructions fingerprint: ${instructions.fingerprint}`,
-      redactSensitiveText(instructions.combinedText)
-    ].join("\n\n");
-    const taskPrompt = [
-      `TASK:\n${options.task}`,
-      options.context?.trim() ? `PARENT CONTEXT:\n${redactSensitiveText(options.context.slice(0, 20_000))}` : "",
-      contextChunks.length ? `SCOPED FILE CONTEXT:\n${contextChunks.join("\n\n")}` : "No repository file contents were delegated.",
-      "Return: summary, findings with evidence, proposed/actual changes, commands/tests you believe the parent should verify, and unresolved questions."
-    ].filter(Boolean).join("\n\n");
-    const session = await this.backend.create({ id, role: options.role, task: "", systemPrompt, model: this.config.deepseekModel });
-    const agent: ManagedAgent = { id, role: options.role, backend: "deepseek", model: this.config.deepseekModel, task: options.task, state: "created", createdAt: new Date().toISOString(), workspaceRoot: workspace.root, worktree, paths, session };
-    this.agents.set(id, agent);
-    agent.state = "running";
-    try {
-      const response = await this.backend.send(session, taskPrompt);
-      agent.result = parseResult(response.content, worktree);
-      if (worktree) {
-        const patch = applyImplementerPatch(worktree, response.content);
-        agent.result.commandsRun.push({ command: "git apply --check && git apply", note: patch.note });
-        Object.assign(agent.result, worktreeEvidence(worktree));
-      }
-      agent.state = "completed";
-    } catch (error) {
-      agent.state = "failed"; agent.error = redactSensitiveText(error instanceof Error ? error.message : String(error));
-    }
-    return this.get(id);
+  private runningCount(): number {
+    return [...this.agents.values()].filter((agent) => agent.state === "running" || agent.state === "waiting").length;
   }
 
-  async message(id: string, message: string): Promise<ManagedAgent> {
-    const agent = this.get(id);
-    if (agent.state === "cancelled") throw new CodexProError("subagent is cancelled");
+  private startRun(agent: ManagedAgent, prompt: string): void {
+    if (this.runs.has(agent.id)) throw new CodexProError("subagent already has an active request");
+    const controller = new AbortController();
+    this.runs.set(agent.id, controller);
     agent.state = "running";
+    agent.error = undefined;
+    void this.runAgent(agent, prompt, controller).catch((error) => {
+      if (agent.state !== "cancelled") {
+        agent.state = "failed";
+        agent.error = redactSensitiveText(error instanceof Error ? error.message : String(error));
+      }
+    }).finally(() => {
+      if (this.runs.get(agent.id) === controller) this.runs.delete(agent.id);
+    });
+  }
+
+  private async runAgent(agent: ManagedAgent, prompt: string, controller: AbortController): Promise<void> {
     try {
-      const response = await this.backend.send(agent.session, redactSensitiveText(message));
+      const response = await this.backend.send(agent.session, prompt, controller.signal);
+      if (controller.signal.aborted || agent.state === "cancelled") return;
       agent.result = parseResult(response.content, agent.worktree);
       if (agent.worktree) {
         const patch = applyImplementerPatch(agent.worktree, response.content);
         agent.result.commandsRun.push({ command: "git apply --check && git apply", note: patch.note });
         Object.assign(agent.result, worktreeEvidence(agent.worktree));
       }
-      agent.state = "completed";
-    } catch (error) { agent.state = "failed"; agent.error = redactSensitiveText(error instanceof Error ? error.message : String(error)); }
+      if (!controller.signal.aborted) agent.state = "completed";
+    } catch (error) {
+      if (controller.signal.aborted || agent.state === "cancelled") return;
+      throw error;
+    }
+  }
+
+  async spawn(workspace: Workspace, options: { task: string; role: AgentRole; paths?: string[]; context?: string; parentId?: string }): Promise<ManagedAgent> {
+    if (!this.config.subagentsEnabled) throw new CodexProError("subagents are disabled");
+    if (this.runningCount() + this.pendingSpawns >= this.config.maxSubagents) throw new CodexProError(`maximum concurrent subagents reached (${this.config.maxSubagents})`);
+    if (options.parentId) throw new CodexProError(`recursive subagent spawning is disabled at the tool layer (max depth ${this.config.maxAgentDepth})`);
+    if (!options.task.trim()) throw new CodexProError("subagent task is required");
+    this.pendingSpawns += 1;
+    try {
+      const id = `agent-${randomUUID().slice(0, 8)}`;
+      const paths = (options.paths ?? []).slice(0, 20).filter((rel) => !SENSITIVE_PATH.test(rel.replaceAll("\\", "/")));
+      const instructions = await instructionResolver.resolve(this.config, this.guard, workspace, paths[0] ?? ".", { maxBytes: 20_000 });
+      const contextChunks: string[] = [];
+      for (const rel of paths) {
+        try {
+          const read = await readTextFile(this.config, this.guard, workspace, rel, { maxBytes: 30_000 });
+          contextChunks.push(`--- ${rel} ---\n${redactSensitiveText(read.text)}`);
+        } catch (error) {
+          contextChunks.push(`--- ${rel} ---\n[not supplied: ${error instanceof Error ? error.message : String(error)}]`);
+        }
+      }
+      const worktree = options.role === "implementer" ? this.worktrees.create(workspace, id) : undefined;
+      const systemPrompt = [
+        "You are a delegated CodexPro subagent. Your output is untrusted working material and will be independently verified by the parent ChatGPT agent.",
+        ROLE_TEXT[options.role],
+        "Do not request or expose credentials, API keys, cookies, tokens, private keys, .env files, or unrelated repository data.",
+        "Do not claim commands/tests/browser actions ran unless their actual output was supplied to you.",
+        worktree ? `Your isolated worktree is ${worktree.path}. For source changes, return a complete git-style unified diff in a fenced diff block so CodexPro can validate and apply it only inside that worktree.` : "You do not have write capability to the repository.",
+        `Applicable repository instructions fingerprint: ${instructions.fingerprint}`,
+        redactSensitiveText(instructions.combinedText)
+      ].join("\n\n");
+      const taskPrompt = [
+        `TASK:\n${options.task}`,
+        options.context?.trim() ? `PARENT CONTEXT:\n${redactSensitiveText(options.context.slice(0, 20_000))}` : "",
+        contextChunks.length ? `SCOPED FILE CONTEXT:\n${contextChunks.join("\n\n")}` : "No repository file contents were delegated.",
+        "Return: summary, findings with evidence, proposed/actual changes, commands/tests you believe the parent should verify, and unresolved questions."
+      ].filter(Boolean).join("\n\n");
+      const session = await this.backend.create({ id, role: options.role, task: "", systemPrompt, model: this.backend.model });
+      const agent: ManagedAgent = {
+        id,
+        role: options.role,
+        backend: session.backend,
+        model: session.model,
+        task: options.task,
+        state: "created",
+        createdAt: new Date().toISOString(),
+        workspaceRoot: workspace.root,
+        worktree,
+        paths,
+        session
+      };
+      this.agents.set(id, agent);
+      this.startRun(agent, taskPrompt);
+      return this.get(id);
+    } finally {
+      this.pendingSpawns -= 1;
+    }
+  }
+
+  async message(id: string, message: string): Promise<ManagedAgent> {
+    const agent = this.get(id);
+    if (agent.state === "cancelled") throw new CodexProError("subagent is cancelled");
+    if (this.runs.has(id)) throw new CodexProError("subagent is still running; wait for completion before sending a follow-up");
+    this.startRun(agent, redactSensitiveText(message));
     return this.get(id);
   }
 
-  async cancel(id: string): Promise<ManagedAgent> { const agent = this.get(id); await this.backend.cancel(id); agent.state = "cancelled"; return this.get(id); }
-  cleanup(workspace: Workspace, id: string): void { const agent = this.get(id); if (agent.worktree) this.worktrees.remove(workspace, agent.worktree.id, { discardChanges: true }); }
+  async cancel(id: string): Promise<ManagedAgent> {
+    const agent = this.get(id);
+    this.runs.get(id)?.abort();
+    await this.backend.cancel(agent.session.id);
+    agent.state = "cancelled";
+    return this.get(id);
+  }
+
+  cleanup(workspace: Workspace, id: string): void {
+    const agent = this.get(id);
+    if (agent.worktree) this.worktrees.remove(workspace, agent.worktree.id, { discardChanges: true });
+  }
 }

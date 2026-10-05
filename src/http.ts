@@ -19,6 +19,7 @@ import {
   type WorkspaceProfile
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
+import { ChatGPTBrowserManager } from "./chatgptBrowserManager.js";
 import { createCodexProServer } from "./server.js";
 import { CODEXPRO_VERSION } from "./version.js";
 
@@ -1445,6 +1446,12 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
+  const chatgptBrowserManager = new ChatGPTBrowserManager(config);
+  if (config.chatgptBrowserAutoStart) {
+    void chatgptBrowserManager.openOrFocus().catch((error) => {
+      console.error(`[CodexPro] ChatGPT browser auto-start failed: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`);
+    });
+  }
   if (config.requireHttpToken && !config.authToken) {
     throw new Error(
       "CODEXPRO_HTTP_TOKEN is required for this HTTP binding. " +
@@ -1674,6 +1681,20 @@ async function main(): Promise<void> {
     jsonError(res, 405, "method_not_allowed", "Use GET or POST for /admin/profile.");
   });
 
+  app.post("/admin/chatgpt-browser/open", adminRateLimit, async (req, res) => {
+    const remote = req.socket.remoteAddress ?? "";
+    if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote)) {
+      jsonError(res, 403, "local_only", "ChatGPT browser control is available only from the local machine.");
+      return;
+    }
+    try {
+      const result = await chatgptBrowserManager.openOrFocus();
+      res.json({ ok: true, ...result });
+    } catch (error) {
+      jsonError(res, 503, "chatgpt_browser_unavailable", redactSensitiveText(error instanceof Error ? error.message : String(error)));
+    }
+  });
+
   app.post("/mcp", express.json({ limit: "20mb" }), async (req, res) => {
     try {
       const sessionId = requestSessionId(req);
@@ -1701,7 +1722,7 @@ async function main(): Promise<void> {
           if (closedSessionId) transports.delete(closedSessionId);
         };
 
-        const server = createCodexProServer(config, knownWorkspaceRoots);
+        const server = createCodexProServer(config, knownWorkspaceRoots, { chatgptBrowserManager });
         await server.connect(transport);
       } else {
         sendSessionError(res, sessionId);
@@ -1768,7 +1789,7 @@ async function main(): Promise<void> {
     next(error);
   });
 
-  app.listen(config.port, config.host, () => {
+  const httpServer = app.listen(config.port, config.host, () => {
     console.error(`[CodexPro] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);
     console.error(`[CodexPro] defaultRoot=${config.defaultRoot}`);
     console.error(`[CodexPro] allowedRoots=${config.allowedRoots.join(", ")}`);
@@ -1776,6 +1797,17 @@ async function main(): Promise<void> {
     console.error(`[CodexPro] writeMode=${config.writeMode}`);
     console.error(`[CodexPro] widgetDomain=${config.widgetDomain}`);
   });
+
+  let shuttingDown = false;
+  const shutdown = async (exitCode: number): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await chatgptBrowserManager.closeAll().catch(() => undefined);
+    httpServer.close(() => process.exit(exitCode));
+    setTimeout(() => process.exit(exitCode), 2_000).unref();
+  };
+  process.once("SIGINT", () => { void shutdown(130); });
+  process.once("SIGTERM", () => { void shutdown(143); });
 }
 
 main().catch((error) => {

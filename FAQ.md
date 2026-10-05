@@ -175,6 +175,14 @@ CodexPro does not bypass, avoid, increase, pool, resell, or modify ChatGPT, Code
 
 The useful part is that Codex and ChatGPT are different product surfaces. If one workflow is unavailable and another product surface you already have access to is still available, CodexPro lets you work against the same local repo without changing either product's limits.
 
+## How do experimental ChatGPT-browser subagents work?
+
+Set `CODEXPRO_SUBAGENT_PROVIDER=chatgpt-browser` (or select it during `codexpro setup`). CodexPro starts one dedicated, visible, persistent Chrome profile and creates one normal ChatGPT conversation/tab for each subagent. Sign into that dedicated profile manually the first time. Setup can save automatic browser startup, and `b` in the interactive CodexPro terminal opens or focuses the browser on demand.
+
+This backend uses the normal ChatGPT web UI. It does not use OpenAI API inference, Codex inference, `OPENAI_API_KEY`, or a DeepSeek key. CodexPro does not inspect browser cookies/storage, extract session credentials, automate password entry, or copy your normal Chrome profile. It also does not attempt CAPTCHA bypass, fingerprint spoofing, anti-bot evasion, rate-limit bypass, or account-restriction bypass. If ChatGPT requires login or manual verification, interact with the visible browser yourself and retry.
+
+Each worker remains attached to the same browser tab for follow-up messages, and its ChatGPT conversation URL is exposed in subagent metadata when available. The web adapter is experimental and may need maintenance when ChatGPT changes its DOM or accessibility structure. Usage remains subject to the user's normal ChatGPT plan and account limits.
+
 ## Can CodexPro use GPT-5.5?
 
 Only if your ChatGPT account already exposes that exact model, or a similar stronger model, in the ChatGPT web product surface you are using, and that model surface can call custom MCP plugins.

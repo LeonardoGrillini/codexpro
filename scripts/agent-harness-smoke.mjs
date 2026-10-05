@@ -16,6 +16,15 @@ const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-agent-harness-'));
 const oldCwd = process.cwd();
 const oldEnv = { ...process.env };
 
+async function waitFor(predicate, message, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(message);
+}
+
 try {
   process.chdir(tmp);
   delete process.env.DEEPSEEK_API_KEY;
@@ -23,11 +32,12 @@ try {
   process.env.CODEXPRO_ALLOWED_ROOTS = tmp;
   process.env.CODEXPRO_BROWSER_ENABLED = '0';
   process.env.CODEXPRO_SUBAGENTS_ENABLED = '1';
+  process.env.CODEXPRO_SUBAGENT_PROVIDER = 'chatgpt-browser';
   const config = loadConfig([]);
-  assert.equal(config.subagentsEnabled, false, 'subagents must be unavailable without DEEPSEEK_API_KEY');
+  assert.equal(config.subagentsEnabled, true, 'chatgpt-browser subagents must be available without a DeepSeek key');
   assert.equal(config.deepseekApiKey, undefined);
   const fullWithoutKey = toolNamesForMode({ ...config, toolMode: 'full' });
-  assert.equal(fullWithoutKey.some((name) => name.startsWith('subagent_')), false, 'no key must remove all subagent tools');
+  assert.equal(fullWithoutKey.some((name) => name.startsWith('subagent_')), true, 'chatgpt-browser must expose subagent tools without a DeepSeek key');
   assert.equal(fullWithoutKey.includes('git'), true, 'ordinary structured git remains available without DeepSeek');
   const standardWithBrowser = toolNamesForMode({ ...config, toolMode: 'standard', browserEnabled: true });
   assert.equal(standardWithBrowser.includes('browser'), true, 'enabled browser must be available in standard tool mode');
@@ -128,6 +138,8 @@ try {
     worktrees.remove(workspace, record.id);
 
     const fakeBackend = {
+      name: 'fake',
+      model: 'mock-model',
       async create(options) { return { id: options.id, backend: 'fake', model: options.model, messages: [{ role: 'system', content: options.systemPrompt }] }; },
       async send(session, message) {
         session.messages.push({ role: 'user', content: message });
@@ -137,16 +149,16 @@ try {
       },
       async cancel() {}
     };
-    const agentConfig = { ...config, subagentsEnabled: true, deepseekModel: 'mock-model' };
-    Object.defineProperty(agentConfig, ['deepseek', 'Api', 'Key'].join(''), { value: 'placeholder', enumerable: true });
+    const agentConfig = { ...config, subagentsEnabled: true };
     const agents = new AgentManager(agentConfig, guard, fakeBackend);
     const implementer = await agents.spawn(workspace, { role: 'implementer', task: 'change the tracked fixture', paths: ['tracked.txt'] });
-    assert.equal(implementer.state, 'completed');
-    assert.ok(implementer.worktree, 'implementer must receive an isolated worktree');
+    await waitFor(() => agents.get(implementer.id).state === 'completed', 'implementer did not complete asynchronously');
+    const completed = agents.get(implementer.id);
+    assert.ok(completed.worktree, 'implementer must receive an isolated worktree');
     assert.equal(await fs.readFile(path.join(tmp, 'tracked.txt'), 'utf8'), 'base\n', 'primary workspace must not be edited');
-    assert.equal((await fs.readFile(path.join(implementer.worktree.path, 'tracked.txt'), 'utf8')).replace(/\r\n/g, '\n'), 'agent change\n', `validated patch must apply in worktree: ${JSON.stringify(implementer.result.commandsRun)}`);
-    assert.deepEqual(implementer.result.changedFiles, ['tracked.txt']);
-    agents.cleanup(workspace, implementer.id);
+    assert.equal((await fs.readFile(path.join(completed.worktree.path, 'tracked.txt'), 'utf8')).replace(/\r\n/g, '\n'), 'agent change\n', `validated patch must apply in worktree: ${JSON.stringify(completed.result.commandsRun)}`);
+    assert.deepEqual(completed.result.changedFiles, ['tracked.txt']);
+    agents.cleanup(workspace, completed.id);
   }
 
   console.log('agent harness smoke: ok');

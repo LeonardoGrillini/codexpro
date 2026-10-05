@@ -3,15 +3,20 @@ import { CodexProError } from "./guard.js";
 import { redactSensitiveText } from "./redact.js";
 
 export class DeepSeekBackend implements AgentBackend {
+  readonly name = "deepseek";
   private readonly controllers = new Map<string, AbortController>();
-  constructor(private readonly apiKey: string) {
+
+  constructor(
+    private readonly apiKey: string,
+    readonly model: string = "deepseek-chat"
+  ) {
     if (!apiKey.trim()) throw new CodexProError("DeepSeek backend requires a configured API key");
   }
 
   async create(options: AgentOptions): Promise<AgentSession> {
     const messages: AgentMessage[] = [{ role: "system", content: options.systemPrompt }];
     if (options.task.trim()) messages.push({ role: "user", content: options.task });
-    return { id: options.id, backend: "deepseek", model: options.model, messages };
+    return { id: options.id, backend: this.name, model: options.model || this.model, messages };
   }
 
   async send(session: AgentSession, message: string, signal?: AbortSignal): Promise<AgentMessage> {

@@ -22,7 +22,9 @@ import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { GitService, WorktreeManager } from "./gitService.js";
 import { BrowserManager } from "./browserManager.js";
-import { DeepSeekBackend } from "./deepseekBackend.js";
+import type { AgentBackend } from "./agentBackend.js";
+import { createAgentBackend, subagentBackendAvailable } from "./agentBackendFactory.js";
+import { ChatGPTBrowserManager } from "./chatgptBrowserManager.js";
 import { AgentManager } from "./agentManager.js";
 import { VmManager, runVmToolAction } from "./vm/index.js";
 import { CODEXPRO_VERSION } from "./version.js";
@@ -506,7 +508,7 @@ export function toolNamesForMode(config: CodexProConfig): string[] {
     const browserIndex = names.indexOf("browser");
     if (browserIndex !== -1) names.splice(browserIndex, 1);
   }
-  if (!config.subagentsEnabled || !config.deepseekApiKey) {
+  if (!subagentBackendAvailable(config)) {
     for (const name of [...names]) {
       if (!name.startsWith("subagent_")) continue;
       const index = names.indexOf(name);
@@ -548,7 +550,7 @@ function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
   if (name === "read_codex_session") return config.codexSessions === "read";
   if (name === "inspect_workspace" && !config.analysisEnabled) return false;
   if (name === "browser" && !config.browserEnabled) return false;
-  if (name.startsWith("subagent_") && (!config.subagentsEnabled || !config.deepseekApiKey)) return false;
+  if (name.startsWith("subagent_") && !subagentBackendAvailable(config)) return false;
   if (name === "handoff_to_agent" && config.writeMode === "handoff") return true;
   if (config.toolMode === "full") return true;
   if (config.toolMode === "minimal") return MINIMAL_TOOLS.has(name);
@@ -1079,6 +1081,8 @@ const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, d
 
 export interface CodexProServerDependencies {
   browserManager?: BrowserManager;
+  agentBackend?: AgentBackend;
+  chatgptBrowserManager?: ChatGPTBrowserManager;
 }
 
 export function createCodexProServer(
@@ -1094,9 +1098,14 @@ export function createCodexProServer(
   const worktreeManager = new WorktreeManager(config);
   const browserManager = dependencies.browserManager ?? new BrowserManager(config, guard);
   const vmManager = new VmManager();
-  const agentManager = config.subagentsEnabled && config.deepseekApiKey
-    ? new AgentManager(config, guard, new DeepSeekBackend(config.deepseekApiKey))
-    : undefined;
+  const backendSelection = dependencies.agentBackend
+    ? { backend: dependencies.agentBackend, chatgptBrowserManager: dependencies.chatgptBrowserManager }
+    : createAgentBackend(config, { chatgptBrowserManager: dependencies.chatgptBrowserManager });
+  const agentManager = backendSelection ? new AgentManager(config, guard, backendSelection.backend) : undefined;
+  const chatgptBrowserManager = backendSelection?.chatgptBrowserManager ?? dependencies.chatgptBrowserManager;
+  if (config.chatgptBrowserAutoStart && chatgptBrowserManager && !dependencies.chatgptBrowserManager) {
+    void chatgptBrowserManager.openOrFocus().catch((error) => console.error(`[CodexPro] ChatGPT browser auto-start failed: ${errorText(error)}`));
+  }
   const server = new McpServer({ name: "CodexPro", version: CODEXPRO_VERSION }, { instructions: serverInstructions(config) });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);
@@ -2542,48 +2551,48 @@ export function createCodexProServer(
     "subagent_spawn",
     {
       title: "Spawn Subagent",
-      description: "Spawn a persistent DeepSeek subagent with scoped repository context. Its result is untrusted and must be independently verified. Not registered without a DeepSeek API key.",
+      description: "Spawn a persistent subagent using the selected provider with scoped repository context. Returns promptly while the worker continues asynchronously. Its result is untrusted and must be independently verified.",
       inputSchema: { workspace_id: z.string().optional(), task: z.string(), role: z.enum(["explorer", "reviewer", "tester", "implementer"]), paths: z.array(z.string()).max(20).optional(), context: z.string().max(20000).optional() },
       annotations: BASH_ANNOTATIONS
     },
     async (args) => {
-      if (!agentManager) throw new CodexProError("DeepSeek subagents are unavailable.");
+      if (!agentManager) throw new CodexProError("Subagents are unavailable for the selected provider.");
       const workspace = workspaces.getWorkspace(args.workspace_id);
       const agent = await agentManager.spawn(workspace, { task: args.task, role: args.role, paths: args.paths, context: args.context });
-      return textResult(`# Subagent ${agent.id}\n\nState: ${agent.state}\nRole: ${agent.role}\nSummary: ${agent.result?.summary ?? agent.error ?? "no result"}\n\nUNTRUSTED: verify source, diff, tests, Git state, and browser evidence independently.`, { id: agent.id, state: agent.state, role: agent.role, model: agent.model, worktree: agent.worktree ?? null, result: agent.result ?? null, error: agent.error ?? null, untrusted: true });
+      return textResult(`# Subagent ${agent.id}\n\nState: ${agent.state}\nRole: ${agent.role}\nSummary: ${agent.result?.summary ?? agent.error ?? "no result"}\n\nUNTRUSTED: verify source, diff, tests, Git state, and browser evidence independently.`, { id: agent.id, state: agent.state, role: agent.role, backend: agent.backend, model: agent.model, worktree: agent.worktree ?? null, external_conversation: agent.session.externalConversation ?? null, result: agent.result ?? null, error: agent.error ?? null, untrusted: true });
     }
   );
 
   registerCodexTool(config, server, "subagent_message", {
-    title: "Message Subagent", description: "Send a follow-up to an existing persistent DeepSeek subagent.", inputSchema: { id: z.string(), message: z.string() }, annotations: BASH_ANNOTATIONS
+    title: "Message Subagent", description: "Send a follow-up to the same persistent subagent session/conversation.", inputSchema: { id: z.string(), message: z.string() }, annotations: BASH_ANNOTATIONS
   }, async (args) => {
-    if (!agentManager) throw new CodexProError("DeepSeek subagents are unavailable.");
+    if (!agentManager) throw new CodexProError("Subagents are unavailable for the selected provider.");
     const agent = await agentManager.message(args.id, args.message);
-    return textResult(`# Subagent ${agent.id}\n\nState: ${agent.state}\nSummary: ${agent.result?.summary ?? agent.error ?? "no result"}`, { id: agent.id, state: agent.state, result: agent.result ?? null, error: agent.error ?? null, untrusted: true });
+    return textResult(`# Subagent ${agent.id}\n\nState: ${agent.state}\nSummary: ${agent.result?.summary ?? agent.error ?? "no result"}`, { id: agent.id, state: agent.state, backend: agent.backend, model: agent.model, external_conversation: agent.session.externalConversation ?? null, result: agent.result ?? null, error: agent.error ?? null, untrusted: true });
   });
 
   registerCodexTool(config, server, "subagent_status", {
     title: "Subagent Status", description: "Inspect one or all subagent states.", inputSchema: { id: z.string().optional() }, annotations: READ_ONLY_ANNOTATIONS
   }, async (args) => {
-    if (!agentManager) throw new CodexProError("DeepSeek subagents are unavailable.");
+    if (!agentManager) throw new CodexProError("Subagents are unavailable for the selected provider.");
     const agents = args.id ? [agentManager.get(args.id)] : agentManager.list();
-    const status = agents.map((agent) => ({ id: agent.id, role: agent.role, state: agent.state, model: agent.model, created_at: agent.createdAt, worktree: agent.worktree ?? null, error: agent.error ?? null }));
+    const status = agents.map((agent) => ({ id: agent.id, role: agent.role, state: agent.state, backend: agent.backend, model: agent.model, created_at: agent.createdAt, worktree: agent.worktree ?? null, external_conversation: agent.session.externalConversation ?? null, error: agent.error ?? null }));
     return textResult(`# Subagent Status\n\n${JSON.stringify(status, null, 2)}`, { agents: status });
   });
 
   registerCodexTool(config, server, "subagent_result", {
     title: "Subagent Result", description: "Return the latest evidence-oriented subagent result. Always independently verify it.", inputSchema: { id: z.string() }, annotations: READ_ONLY_ANNOTATIONS
   }, async (args) => {
-    if (!agentManager) throw new CodexProError("DeepSeek subagents are unavailable.");
+    if (!agentManager) throw new CodexProError("Subagents are unavailable for the selected provider.");
     const agent = agentManager.get(args.id);
-    return textResult(`# Subagent Result ${agent.id}\n\n${agent.result?.rawResponse ?? agent.error ?? "No result yet."}\n\nUNTRUSTED: independently verify all claims.`, { id: agent.id, state: agent.state, result: agent.result ?? null, error: agent.error ?? null, untrusted: true });
+    return textResult(`# Subagent Result ${agent.id}\n\n${agent.result?.rawResponse ?? agent.error ?? "No result yet."}\n\nUNTRUSTED: independently verify all claims.`, { id: agent.id, state: agent.state, backend: agent.backend, model: agent.model, external_conversation: agent.session.externalConversation ?? null, result: agent.result ?? null, error: agent.error ?? null, untrusted: true });
   });
 
   registerCodexTool(config, server, "subagent_cancel", {
-    title: "Cancel Subagent", description: "Cancel a running DeepSeek subagent request. Optionally clean up its CodexPro-owned worktree; cleanup may discard unmerged child-worktree changes and is explicit.",
+    title: "Cancel Subagent", description: "Cancel a running subagent request. Browser-backed workers stop visible generation when possible without terminating the shared Chrome instance. Worktree cleanup remains explicit.",
     inputSchema: { id: z.string(), workspace_id: z.string().optional(), cleanup_worktree: z.boolean().optional() }, annotations: LOCAL_WRITE_ANNOTATIONS
   }, async (args) => {
-    if (!agentManager) throw new CodexProError("DeepSeek subagents are unavailable.");
+    if (!agentManager) throw new CodexProError("Subagents are unavailable for the selected provider.");
     const agent = await agentManager.cancel(args.id);
     const cleanup = parseBool(args.cleanup_worktree, false);
     if (cleanup && agent.worktree) agentManager.cleanup(workspaces.getWorkspace(args.workspace_id), agent.id);

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { BashMode, BashTranscriptMode, CodexSessionsMode, ToolMode, WriteMode } from "./config.js";
+import type { BashMode, BashTranscriptMode, CodexSessionsMode, SubagentProvider, ToolMode, WriteMode } from "./config.js";
 import { expandHome } from "./config.js";
 
 export type TunnelMode = "none" | "cloudflare" | "cloudflare-named" | "ngrok" | "tailscale";
@@ -33,6 +33,8 @@ export interface WorkspaceProfile {
   toolMode?: ToolMode | string;
   toolCards?: boolean;
   widgetDomain?: string;
+  subagentProvider?: SubagentProvider | string;
+  chatgptBrowserAutoStart?: boolean;
   noInstallCloudflared?: boolean;
   allowedRoots?: string[];
 }
