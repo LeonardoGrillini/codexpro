@@ -1,7 +1,7 @@
 import path from "node:path";
 import { codexProHome } from "../profileStore.js";
 import type { CommandExecutor } from "./command.js";
-import type { VmArchitecture, VmImageManifest, VmInstanceRecord, VmBackendKind } from "./types.js";
+import type { VmArchitecture, VmImageManifest, VmInstanceRecord, VmBackendKind, VmSecureBootMode } from "./types.js";
 export interface VmManagerOptions {
   /** Platform injection for tests; the CLI always uses the actual host platform. */
   platform?: NodeJS.Platform;
@@ -19,6 +19,8 @@ export interface SetupVmImageOptions {
   cpus: number;
   memoryMb: number;
   desktop: boolean;
+  /** Hyper-V only: off, Microsoft Windows, or Microsoft UEFI CA. */
+  secureBoot?: VmSecureBootMode;
   validate?: boolean;
   diskSizeGb?: number;
   headless?: boolean;
@@ -57,6 +59,7 @@ export interface PublicVmImage {
   defaultCpus: number;
   defaultMemoryMb: number;
   desktop: boolean;
+  secureBoot?: VmSecureBootMode;
   createdAt: string;
   validation: {
     bootTested: boolean;
@@ -87,6 +90,7 @@ export function publicVmImage(manifest: VmImageManifest): PublicVmImage {
     defaultCpus: manifest.defaultCpus,
     defaultMemoryMb: manifest.defaultMemoryMb,
     desktop: manifest.desktop,
+    ...(manifest.secureBoot ? { secureBoot: manifest.secureBoot } : {}),
     createdAt: manifest.createdAt,
     validation: { ...manifest.validation }
   };

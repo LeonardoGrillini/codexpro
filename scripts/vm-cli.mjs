@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline/promises';
 import { pathToFileURL } from 'node:url';
 
 const BOOLEAN_OPTIONS = new Set(['desktop', 'no-desktop', 'validate', 'no-validate', 'headless', 'help']);
-const VALUE_OPTIONS = new Set(['name', 'image', 'architecture', 'arch', 'cpus', 'memory', 'disk-size', 'vm-home', 'qemu', 'qemu-img']);
+const VALUE_OPTIONS = new Set(['name', 'image', 'architecture', 'arch', 'cpus', 'memory', 'disk-size', 'secure-boot', 'vm-home', 'qemu', 'qemu-img']);
 
 function parseVmArgs(argv) {
   const out = { positional: [] };
@@ -54,6 +54,12 @@ function positiveInteger(value, label, fallback) {
   const number = Number(raw);
   if (!Number.isSafeInteger(number) || number <= 0) throw new Error(`${label} must be a positive integer.`);
   return number;
+}
+
+function secureBootMode(value, fallback = 'off') {
+  const mode = String(value ?? fallback).trim().toLowerCase();
+  if (!['off', 'windows', 'uefi-ca'].includes(mode)) throw new Error('--secure-boot must be one of: off, windows, uefi-ca.');
+  return mode;
 }
 
 function humanBytes(value) {
@@ -124,6 +130,7 @@ Setup options:
   --cpus <n>                 Default virtual CPUs.
   --memory <MiB>             Default memory in MiB.
   --disk-size <GiB>          Target disk size for ISO installation. Default: 64 GiB.
+  --secure-boot <mode>       Hyper-V only: off, windows, or uefi-ca. Default: off.
   --vm-home <dir>            VM storage root. Setup remembers the selected location.
   --desktop                  Mark the image as providing a desktop environment.
   --validate                 Perform a bounded validation boot (QGA probe on QEMU only).
@@ -148,6 +155,7 @@ async function setupCommand(runtime, args) {
   let cpus = args.cpus;
   let memory = args.memory;
   let diskSize = args.diskSize;
+  let secureBoot = args.secureBoot;
   let vmHome = args.vmHome ?? runtime.configuredVmRoot() ?? runtime.vmHomeLayout().root;
   let desktop = args.desktop ?? false;
   let validate = args.validate ?? false;
@@ -172,6 +180,9 @@ async function setupCommand(runtime, args) {
       if (path.extname(expandUserPath(image)).toLowerCase() === '.iso') {
         diskSize = await ask(rl, 'Installation disk size (GiB)', diskSize ?? defaultDiskSize);
       }
+      if (process.platform === 'win32') {
+        secureBoot = await ask(rl, 'Hyper-V Secure Boot mode (off/windows/uefi-ca)', secureBoot ?? 'off');
+      }
       vmHome = await ask(rl, 'VM storage location', vmHome);
       desktop = await askBoolean(rl, 'Does this image provide a desktop environment?', desktop);
       validate = await askBoolean(rl, 'Perform a validation boot now?', validate);
@@ -186,6 +197,7 @@ async function setupCommand(runtime, args) {
   const resolvedImage = path.resolve(expandUserPath(image));
   const isInstallerIso = path.extname(resolvedImage).toLowerCase() === '.iso';
   const resolvedVmHome = path.resolve(expandUserPath(vmHome));
+  if (process.platform !== 'win32' && secureBoot !== undefined) throw new Error('--secure-boot is supported only by the Windows Hyper-V backend.');
   if (isInstallerIso && !args.headless) {
     console.log('\nInstaller ISO detected. CodexPro will create a blank disk and open the native VM console.');
     console.log('Complete the OS installation in the VM console, then shut the VM down to finish importing the disk.\n');
@@ -204,6 +216,7 @@ async function setupCommand(runtime, args) {
     cpus: positiveInteger(cpus, '--cpus', defaultCpus),
     memoryMb: positiveInteger(memory, '--memory', defaultMemory),
     desktop: Boolean(desktop),
+    ...(process.platform === 'win32' ? { secureBoot: secureBootMode(secureBoot) } : {}),
     validate: Boolean(validate),
     diskSizeGb: positiveInteger(diskSize, '--disk-size', defaultDiskSize),
     headless: Boolean(args.headless),
@@ -217,6 +230,7 @@ async function setupCommand(runtime, args) {
   console.log(`Virtual size          ${humanBytes(manifest.virtualSize)}`);
   console.log(`Default resources     ${manifest.defaultCpus} CPU / ${manifest.defaultMemoryMb} MiB`);
   console.log(`Desktop               ${manifest.desktop ? 'yes' : 'no'}`);
+  if (manifest.secureBoot) console.log(`Secure Boot           ${manifest.secureBoot}`);
   if (manifest.preferredAccelerator) console.log(`Preferred accelerator  ${manifest.preferredAccelerator}`);
   if (validate) {
     console.log(`Boot validation        ${manifest.validation.bootTested ? '✓' : '✗'}`);

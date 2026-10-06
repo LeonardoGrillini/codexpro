@@ -4,7 +4,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { ImageStore } from "../../imageStore.js";
 import { InstanceStore } from "../../instanceStore.js";
-import { hostArchitecture, validateImageName, validateResources, validateVmGuid, type VmArchitecture, type VmImageManifest, type VmInstanceRecord, type VmInstanceState } from "../../types.js";
+import { hostArchitecture, validateImageName, validateResources, validateVmGuid, type VmArchitecture, type VmImageManifest, type VmInstanceRecord, type VmInstanceState, type VmSecureBootMode } from "../../types.js";
 import type { CreateVmOptions, SetupVmImageOptions, VmDoctorReport, VmManagerOptions } from "../../api.js";
 import { configuredVmRoot, vmHomeLayout } from "../../vmHome.js";
 import { codexProHome } from "../../../profileStore.js";
@@ -120,7 +120,7 @@ export class HypervBackend implements VmBackend {
   }
 
   private importDisk(options: SetupVmImageOptions, sourcePath: string, sourceFileName?: string) {
-    return this.images.importImage({ name: options.name, sourcePath, sourceFileName, architecture: options.architecture, defaultCpus: options.cpus, defaultMemoryMb: options.memoryMb, desktop: options.desktop, importer: this.importer() });
+    return this.images.importImage({ name: options.name, sourcePath, sourceFileName, architecture: options.architecture, defaultCpus: options.cpus, defaultMemoryMb: options.memoryMb, desktop: options.desktop, secureBoot: options.secureBoot ?? "off", importer: this.importer() });
   }
 
   private async allocate(image: string, cpus: number, memory: number, desktop: boolean) {
@@ -146,11 +146,11 @@ export class HypervBackend implements VmBackend {
     return { vmId: validateVmGuid(journal.vmId), ownershipId: record.hyperv.ownershipId };
   }
 
-  private async createVm(record: VmInstanceRecord, disk: string, iso?: string): Promise<void> {
+  private async createVm(record: VmInstanceRecord, disk: string, secureBoot: VmSecureBootMode, iso?: string): Promise<void> {
     const ownershipId = record.hyperv!.ownershipId;
     const result = await this.ps.run<{ vmId: string }>("create", {
       name: hypervName(record.id, ownershipId), ownershipId, cpus: record.cpus, memory: record.memoryMb * 1024 * 1024,
-      disk, iso, directory: record.instanceDir, journal: path.join(record.instanceDir, "hyperv-identity.json")
+      disk, iso, secureBoot, directory: record.instanceDir, journal: path.join(record.instanceDir, "hyperv-identity.json")
     }, 60_000);
     const vmId = validateVmGuid(result.vmId);
     await this.instances.update(record.id, { hyperv: { ownershipId, vmId }, state: iso ? "created" : "starting" });
@@ -189,7 +189,7 @@ export class HypervBackend implements VmBackend {
       const manifest = await this.lock(record, async () => {
         try {
           await this.ps.run("disk", { disk, size: size * 1024 ** 3 });
-          await this.createVm(record, disk, iso);
+          await this.createVm(record, disk, options.secureBoot ?? "off", iso);
           const identity = await this.identity(await this.instances.read(record.id));
           options.onProgress?.(`Installer ${record.id} (${identity.vmId}). In VMConnect, click Start (Avvia), focus the guest display and immediately press Space when prompted to boot from CD/DVD. If the UEFI boot summary appears, click Restart now and press Space immediately. Complete installation, then shut down the guest. Network is disconnected. Setup expires after 4 hours; failed disks are retained.`);
           await this.ps.run("console", identity);
@@ -228,7 +228,7 @@ export class HypervBackend implements VmBackend {
       try {
         const disk = path.join(record.instanceDir, "overlay.vhdx");
         await this.ps.run("disk", { disk, parent: this.images.basePath(image, "vhdx") });
-        await this.createVm(record, disk);
+        await this.createVm(record, disk, manifest.secureBoot ?? "off");
         return await this.instances.read(record.id);
       } catch (e) { return this.failed(record, e); }
     });

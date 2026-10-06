@@ -49,8 +49,15 @@ Enable-VMTPM -VM $vm
 if (!(Get-VMSecurity -VM $vm).TpmEnabled) { throw 'Virtual TPM could not be enabled.' }
 Set-VMProcessor -VM $vm -Count ([int]$p.cpus)
 Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
-# Generic modern UEFI media: Secure Boot is off; no guest credential is needed.
-Set-VMFirmware -VM $vm -EnableSecureBoot Off
+if ($p.secureBoot -eq 'windows') {
+  Set-VMFirmware -VM $vm -EnableSecureBoot On -SecureBootTemplate 'MicrosoftWindows'
+} elseif ($p.secureBoot -eq 'uefi-ca') {
+  Set-VMFirmware -VM $vm -EnableSecureBoot On -SecureBootTemplate 'MicrosoftUEFICertificateAuthority'
+} elseif ($p.secureBoot -eq 'off') {
+  Set-VMFirmware -VM $vm -EnableSecureBoot Off
+} else {
+  throw 'Invalid Hyper-V secure boot mode.'
+}
 if ($p.iso) {
   $dvd = Add-VMDvdDrive -VM $vm -Path $p.iso -Passthru
   Set-VMFirmware -VM $vm -FirstBootDevice $dvd

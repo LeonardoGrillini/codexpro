@@ -1,6 +1,7 @@
 export type VmBackendKind = "qemu" | "hyperv";
 export type VmArchitecture = "x86_64" | "aarch64";
 export type VmAccelerator = "whpx" | "kvm" | "hvf" | "tcg";
+export type VmSecureBootMode = "off" | "windows" | "uefi-ca";
 export type VmInstanceState = "created" | "starting" | "running" | "stopped" | "failed";
 
 export type LocalChannelEndpoint =
@@ -25,6 +26,8 @@ export interface VmImageManifest {
   defaultCpus: number;
   defaultMemoryMb: number;
   desktop: boolean;
+  /** Hyper-V only. Older manifests omit this and are treated as "off". */
+  secureBoot?: VmSecureBootMode;
   preferredAccelerator?: VmAccelerator;
   createdAt: string;
   source: {
@@ -141,6 +144,14 @@ export function parseImageManifest(value: unknown): VmImageManifest {
   const defaultMemoryMb = requiredInteger(input.defaultMemoryMb, "manifest.defaultMemoryMb");
   validateResources(defaultCpus, defaultMemoryMb);
   const desktop = requiredBoolean(input.desktop, "manifest.desktop");
+  let secureBoot: VmSecureBootMode | undefined;
+  if (backend === "hyperv") {
+    const value = input.secureBoot === undefined ? "off" : requiredString(input.secureBoot, "manifest.secureBoot");
+    if (!["off", "windows", "uefi-ca"].includes(value)) throw new Error(`Invalid Hyper-V secure boot mode: ${value}`);
+    secureBoot = value as VmSecureBootMode;
+  } else if (input.secureBoot !== undefined) {
+    throw new Error("QEMU manifests do not use Hyper-V secure boot policy.");
+  }
   let preferredAccelerator: VmAccelerator | undefined;
   if (backend === "hyperv" && input.preferredAccelerator !== undefined) throw new Error("Hyper-V does not use QEMU accelerators.");
   if (input.preferredAccelerator !== undefined) {
@@ -170,6 +181,7 @@ export function parseImageManifest(value: unknown): VmImageManifest {
     defaultCpus,
     defaultMemoryMb,
     desktop,
+    ...(secureBoot ? { secureBoot } : {}),
     ...(preferredAccelerator ? { preferredAccelerator } : {}),
     createdAt,
     source: { originalFileName },

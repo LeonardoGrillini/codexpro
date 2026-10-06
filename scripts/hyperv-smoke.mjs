@@ -31,6 +31,9 @@ assert.match(hypervScripts.create, /Add-VMDvdDrive -VM \$vm -Path \$p.iso -Passt
 assert.match(hypervScripts.create, /Set-VMFirmware -VM \$vm -FirstBootDevice \$dvd/);
 assert.match(hypervScripts.create, /Disconnect-VMNetworkAdapter/);
 assert.doesNotMatch(hypervScripts.create, /-SwitchName/);
+assert.match(hypervScripts.create, /-EnableSecureBoot On -SecureBootTemplate 'MicrosoftWindows'/);
+assert.match(hypervScripts.create, /-EnableSecureBoot On -SecureBootTemplate 'MicrosoftUEFICertificateAuthority'/);
+assert.match(hypervScripts.create, /-EnableSecureBoot Off/);
 assert.match(hypervScripts.disk, /-ParentPath \$p.parent -Differencing/);
 assert.match(hypervScripts.disk, /-SizeBytes .* -Dynamic/);
 assert.match(hypervScripts.destroy, /ownership could not be verified/);
@@ -109,15 +112,17 @@ try {
   await assert.rejects(fs.access(manager.vmHome()));
   const source = path.join(root, "installer'; $(throw 'bad') ü.vhdx");
   await fs.writeFile(source, 'source remains unchanged');
-  const options = { name: 'native', sourcePath: source, architecture: 'x86_64', cpus: 2, memoryMb: 1024, desktop: true };
+  const options = { name: 'native', sourcePath: source, architecture: 'x86_64', cpus: 2, memoryMb: 1024, desktop: true, secureBoot: 'windows' };
   const manifest = await manager.setupImage(options);
   assert.equal(manifest.schemaVersion, 2); assert.equal(manifest.backend, 'hyperv'); assert.equal(manifest.format, 'vhdx');
+  assert.equal(manifest.secureBoot, 'windows');
   assert.equal(parseImageManifest(manifest).backend, 'hyperv');
   assert.equal(manifest.preferredAccelerator, undefined);
   assert.throws(() => parseImageManifest({ ...manifest, format: 'qcow2' }), /format/);
   assert.throws(() => parseImageManifest({ ...manifest, backend: undefined }), /explicit backend/);
   assert.throws(() => parseImageManifest({ ...manifest, schemaVersion: 1 }), /Schema 1/);
-  const legacy = { ...manifest, schemaVersion: 1, backend: undefined, format: 'qcow2' };
+  const { secureBoot: _secureBoot, ...legacyBase } = manifest;
+  const legacy = { ...legacyBase, schemaVersion: 1, backend: undefined, format: 'qcow2' };
   assert.equal(parseImageManifest(legacy).backend, 'qemu');
   assert.equal(parseImageManifest({ ...legacy, schemaVersion: 2, backend: 'qemu' }).format, 'qcow2');
   assert.equal((await manager.inspectImage('native')).sha256, manifest.sha256);
@@ -137,6 +142,7 @@ try {
   const before = await fs.readFile(manager.images.basePath('native', 'vhdx'));
   const instance = await manager.createInstance('native');
   assert.equal(instance.backend, 'hyperv'); assert.equal(instance.accelerator, undefined);
+  assert.equal(calls.find(c => c.operation === 'create' && !c.payload.iso).payload.secureBoot, 'windows');
   assert.equal(instance.qmp, undefined); assert.equal(instance.processId, undefined);
   assert.equal(parseInstanceRecord(instance).hyperv.vmId, instance.hyperv.vmId);
   assert.throws(() => parseInstanceRecord({ ...instance, processId: 10 }), /QEMU runtime/);

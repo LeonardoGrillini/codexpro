@@ -9,7 +9,8 @@ import {
   type VmAccelerator,
   type VmArchitecture,
   type VmImageManifest,
-  type VmImageValidation
+  type VmImageValidation,
+  type VmSecureBootMode
 } from "./types.js";
 import { ensureVmLayout, vmHomeLayout, type VmHomeLayout } from "./vmHome.js";
 import { nodeCommandExecutor, type CommandExecutor } from "./command.js";
@@ -22,6 +23,7 @@ export interface ImportImageOptions {
   defaultCpus: number;
   defaultMemoryMb: number;
   desktop: boolean;
+  secureBoot?: VmSecureBootMode;
   preferredAccelerator?: VmAccelerator;
   qemuImg?: string;
   importer?: DiskImporter;
@@ -137,6 +139,7 @@ export class ImageStore {
         defaultCpus: options.defaultCpus,
         defaultMemoryMb: options.defaultMemoryMb,
         desktop: options.desktop,
+        ...(importer.backend === "hyperv" ? { secureBoot: options.secureBoot ?? "off" } : {}),
         ...(options.preferredAccelerator ? { preferredAccelerator: options.preferredAccelerator } : {}),
         createdAt: new Date().toISOString(),
         source: {
