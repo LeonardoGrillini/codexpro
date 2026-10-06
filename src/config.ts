@@ -233,6 +233,28 @@ function codexProDataPath(...parts: string[]): string {
   return path.join(base, ...parts);
 }
 
+function protectedProfileGlobs(allowedRoots: string[], profilePath: string): string[] {
+  const globs = new Set<string>();
+  const resolvedProfile = path.resolve(profilePath);
+  for (const root of allowedRoots) {
+    const resolvedRoot = path.resolve(root);
+    const rootInsideProfile = path.relative(resolvedProfile, resolvedRoot);
+    if (
+      rootInsideProfile === "" ||
+      (rootInsideProfile !== ".." && !rootInsideProfile.startsWith(`..${path.sep}`) && !path.isAbsolute(rootInsideProfile))
+    ) {
+      throw new Error("The CodexPro ChatGPT browser profile cannot be used as or contain an allowed workspace root.");
+    }
+
+    const relative = path.relative(resolvedRoot, resolvedProfile);
+    if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+    const normalized = relative.split(path.sep).join("/");
+    globs.add(normalized);
+    globs.add(`${normalized}/**`);
+  }
+  return [...globs];
+}
+
 function widgetDomainFrom(value: string | undefined): string {
   const raw = value?.trim() || "https://rebel0789.github.io";
   let parsed: URL;
@@ -350,6 +372,10 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
   const requireBashSession = boolFrom(requireBashSessionArg ?? process.env.CODEXPRO_REQUIRE_BASH_SESSION, false);
   const deepseekApiKey = process.env.DEEPSEEK_API_KEY?.trim() || undefined;
   const subagentProvider = subagentProviderFrom(process.env.CODEXPRO_SUBAGENT_PROVIDER?.trim(), deepseekApiKey);
+  const chatgptBrowserProfilePath = path.resolve(
+    expandHome(process.env.CODEXPRO_CHATGPT_BROWSER_PROFILE?.trim() || codexProDataPath("chatgpt-browser"))
+  );
+  const chatgptBrowserProfileGlobs = protectedProfileGlobs(allowedRoots, chatgptBrowserProfilePath);
   if (requireBashSession && !bashSessionId) {
     throw new Error("CODEXPRO_REQUIRE_BASH_SESSION requires CODEXPRO_BASH_SESSION_ID or --bash-session.");
   }
@@ -386,7 +412,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     maxSearchResults: numberFrom(process.env.CODEXPRO_MAX_SEARCH_RESULTS, 200, 5, 2_000),
     maxHttpSessions: numberFrom(process.env.CODEXPRO_MAX_HTTP_SESSIONS, 64, 1, 512),
     httpSessionTtlMs: numberFrom(process.env.CODEXPRO_HTTP_SESSION_TTL_MS, 30 * 60_000, 60_000, 24 * 60 * 60_000),
-    blockedGlobs: [...DEFAULT_BLOCKED_GLOBS, ...extraBlockedGlobs],
+    blockedGlobs: [...DEFAULT_BLOCKED_GLOBS, ...extraBlockedGlobs, ...chatgptBrowserProfileGlobs],
     contextDir: contextDirFrom(process.env.CODEXPRO_CONTEXT_DIR),
     toolCards: boolFrom(toolCardsArg ?? process.env.CODEXPRO_TOOL_CARDS, false),
     connectionTest: boolFrom(process.env.CODEXPRO_CONNECTION_TEST, false),
@@ -397,8 +423,8 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     subagentProvider,
     subagentsEnabled: boolFrom(process.env.CODEXPRO_SUBAGENTS_ENABLED, true) && subagentProvider !== "off" && (subagentProvider !== "deepseek" || Boolean(deepseekApiKey)),
     chatgptBrowserAutoStart: boolFrom(process.env.CODEXPRO_CHATGPT_BROWSER_AUTO_START, false),
-    chatgptBrowserProfilePath: path.resolve(expandHome(process.env.CODEXPRO_CHATGPT_BROWSER_PROFILE?.trim() || codexProDataPath("chatgpt-browser"))),
-    chatgptBrowserExecutable: process.env.CODEXPRO_CHATGPT_BROWSER_EXECUTABLE?.trim() || undefined,
+    chatgptBrowserProfilePath,
+    chatgptBrowserExecutable: process.env.CODEXPRO_CHROME_PATH?.trim() || process.env.CODEXPRO_CHATGPT_BROWSER_EXECUTABLE?.trim() || undefined,
     chatgptBrowserResponseTimeoutMs: numberFrom(process.env.CODEXPRO_CHATGPT_BROWSER_RESPONSE_TIMEOUT_MS, 180_000, 10_000, 600_000),
     maxSubagents: numberFrom(process.env.CODEXPRO_MAX_SUBAGENTS, 3, 1, 16),
     maxAgentDepth: numberFrom(process.env.CODEXPRO_MAX_AGENT_DEPTH, 1, 1, 4),
