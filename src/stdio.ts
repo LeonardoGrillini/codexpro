@@ -2,6 +2,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
 import { createCodexProServer } from "./server.js";
+import { createCodexProLogger } from "./logging.js";
 import { CODEXPRO_VERSION } from "./version.js";
 
 function printHelp(): void {
@@ -28,9 +29,24 @@ async function main(): Promise<void> {
 
   process.env.CODEXPRO_ALLOW_NO_HTTP_TOKEN ??= "1";
   const config = loadConfig();
-  const server = createCodexProServer(config);
+  const logger = createCodexProLogger({ workspaceRoot: config.defaultRoot, component: "stdio" }).child({
+    transport: "stdio",
+    mcp_session_id: `stdio-${process.pid}`
+  });
+  logger.info("runtime_start", { transport: "stdio", log_dir: logger.runDir });
+  process.on("uncaughtExceptionMonitor", (error, origin) => {
+    logger.error("runtime_uncaught_exception", error, { origin });
+  });
+  const server = createCodexProServer(config, new Map<string, string>(), { logger });
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  process.once("exit", (code) => logger.info("runtime_process_exit", { exit_code: code }));
+  try {
+    await server.connect(transport);
+    logger.info("mcp_transport_connected");
+  } catch (error) {
+    logger.error("runtime_failed", error);
+    throw error;
+  }
 }
 
 main().catch((error) => {

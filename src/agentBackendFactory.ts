@@ -3,9 +3,11 @@ import type { CodexProConfig } from "./config.js";
 import { ChatGPTBrowserBackend } from "./chatgptBrowserBackend.js";
 import { ChatGPTBrowserManager } from "./chatgptBrowserManager.js";
 import { DeepSeekBackend } from "./deepseekBackend.js";
+import type { CodexProLogger } from "./logging.js";
 
 export interface AgentBackendFactoryDependencies {
   chatgptBrowserManager?: ChatGPTBrowserManager;
+  logger?: CodexProLogger;
 }
 
 export interface AgentBackendSelection {
@@ -25,7 +27,7 @@ export function createAgentBackend(
 ): AgentBackendSelection | undefined {
   if (!subagentBackendAvailable(config)) return undefined;
   if (config.subagentProvider === "chatgpt-browser") {
-    const chatgptBrowserManager = dependencies.chatgptBrowserManager ?? new ChatGPTBrowserManager(config);
+    const chatgptBrowserManager = dependencies.chatgptBrowserManager ?? new ChatGPTBrowserManager(config, undefined, undefined, { logger: dependencies.logger });
     return { backend: new ChatGPTBrowserBackend(chatgptBrowserManager), chatgptBrowserManager };
   }
   if (config.subagentProvider === "deepseek" && config.deepseekApiKey) {

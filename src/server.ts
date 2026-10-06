@@ -1,6 +1,6 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -26,6 +26,8 @@ import type { AgentBackend } from "./agentBackend.js";
 import { createAgentBackend, subagentBackendAvailable } from "./agentBackendFactory.js";
 import { ChatGPTBrowserManager } from "./chatgptBrowserManager.js";
 import { AgentManager } from "./agentManager.js";
+import type { CodexProLogger } from "./logging.js";
+import { noopLogger, withLogContext } from "./logging.js";
 import { VmManager, runVmToolAction } from "./vm/index.js";
 import { CODEXPRO_VERSION } from "./version.js";
 
@@ -299,6 +301,7 @@ const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
 };
 
 const registeredToolHandlersByServer = new WeakMap<object, Map<string, CodexToolHandler>>();
+const loggerByServer = new WeakMap<object, CodexProLogger>();
 
 function rememberRegisteredToolHandler(server: McpServer, name: string, handler: CodexToolHandler): void {
   const key = server as object;
@@ -344,15 +347,23 @@ function registerToolCompat(
 ): void {
   const wrapped = async (args: any) => {
     const started = Date.now();
-    try {
-      const result = tagToolResult(await handler(args ?? {}), name, options);
-      logToolCall(name, result?.isError ? "error" : "ok", started);
-      return result;
-    } catch (error) {
-      const result = tagToolResult(errorResult(error), name, options);
-      logToolCall(name, "error", started);
-      return result;
-    }
+    const toolCallId = randomUUID();
+    const logger = (loggerByServer.get(server as object) ?? noopLogger).child({ tool: name, tool_call_id: toolCallId });
+    return withLogContext({ tool: name, tool_call_id: toolCallId }, async () => {
+      logger.info("mcp_tool_started");
+      try {
+        const result = tagToolResult(await handler(args ?? {}), name, options);
+        const status = result?.isError ? "error" : "ok";
+        logger.info("mcp_tool_completed", { status, duration_ms: Date.now() - started });
+        logToolCall(name, status, started);
+        return result;
+      } catch (error) {
+        logger.error("mcp_tool_failed", error, { duration_ms: Date.now() - started });
+        const result = tagToolResult(errorResult(error), name, options);
+        logToolCall(name, "error", started);
+        return result;
+      }
+    });
   };
 
   const securitySchemes = [{ type: "noauth" }];
@@ -1083,6 +1094,7 @@ export interface CodexProServerDependencies {
   browserManager?: BrowserManager;
   agentBackend?: AgentBackend;
   chatgptBrowserManager?: ChatGPTBrowserManager;
+  logger?: CodexProLogger;
 }
 
 export function createCodexProServer(
@@ -1097,16 +1109,25 @@ export function createCodexProServer(
   const gitService = new GitService(config, guard);
   const worktreeManager = new WorktreeManager(config);
   const browserManager = dependencies.browserManager ?? new BrowserManager(config, guard);
+  const logger = dependencies.logger ?? noopLogger;
   const vmManager = new VmManager();
   const backendSelection = dependencies.agentBackend
     ? { backend: dependencies.agentBackend, chatgptBrowserManager: dependencies.chatgptBrowserManager }
-    : createAgentBackend(config, { chatgptBrowserManager: dependencies.chatgptBrowserManager });
-  const agentManager = backendSelection ? new AgentManager(config, guard, backendSelection.backend) : undefined;
+    : createAgentBackend(config, {
+        chatgptBrowserManager: dependencies.chatgptBrowserManager,
+        logger: logger.child({ subsystem: "chatgpt_browser" })
+      });
+  const agentManager = backendSelection ? new AgentManager(config, guard, backendSelection.backend, logger.child({ subsystem: "subagent" })) : undefined;
   const chatgptBrowserManager = backendSelection?.chatgptBrowserManager ?? dependencies.chatgptBrowserManager;
   if (config.chatgptBrowserAutoStart && chatgptBrowserManager && !dependencies.chatgptBrowserManager) {
-    void chatgptBrowserManager.openOrFocus().catch((error) => console.error(`[CodexPro] ChatGPT browser auto-start failed: ${errorText(error)}`));
+    void chatgptBrowserManager.openOrFocus().catch((error) => {
+      logger.error("chatgpt_browser_auto_start_failed", error);
+      console.error(`[CodexPro] ChatGPT browser auto-start failed: ${errorText(error)}`);
+    });
   }
   const server = new McpServer({ name: "CodexPro", version: CODEXPRO_VERSION }, { instructions: serverInstructions(config) });
+  loggerByServer.set(server as object, logger);
+  logger.info("mcp_server_created", { tool_mode: config.toolMode, subagent_provider: config.subagentProvider });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);
 

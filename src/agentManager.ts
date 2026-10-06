@@ -7,6 +7,8 @@ import { CodexProError, PathGuard } from "./guard.js";
 import { readTextFile } from "./fsOps.js";
 import { instructionResolver } from "./instructionContext.js";
 import { WorktreeManager, type WorktreeRecord } from "./gitService.js";
+import type { CodexProLogger } from "./logging.js";
+import { noopLogger } from "./logging.js";
 import { redactSensitiveText } from "./redact.js";
 
 export type AgentState = "created" | "running" | "waiting" | "completed" | "failed" | "cancelled";
@@ -113,7 +115,8 @@ export class AgentManager {
   constructor(
     private readonly config: CodexProConfig,
     private readonly guard: PathGuard,
-    private readonly backend: AgentBackend
+    private readonly backend: AgentBackend,
+    private readonly logger: CodexProLogger = noopLogger
   ) { this.worktrees = new WorktreeManager(config); }
 
   list(): ManagedAgent[] { return [...this.agents.values()].map((agent) => ({ ...agent, session: { ...agent.session, messages: [] } })); }
@@ -123,33 +126,82 @@ export class AgentManager {
     return [...this.agents.values()].filter((agent) => agent.state === "running" || agent.state === "waiting").length;
   }
 
-  private startRun(agent: ManagedAgent, prompt: string): void {
+  private counts(): Record<string, unknown> {
+    return {
+      agent_count: this.agents.size,
+      running_count: this.runningCount(),
+      active_run_count: this.runs.size,
+      pending_spawn_count: this.pendingSpawns,
+      active_agent_ids: [...this.agents.values()]
+        .filter((agent) => agent.state === "running" || agent.state === "waiting")
+        .map((agent) => agent.id)
+    };
+  }
+
+  private agentLogger(agent: ManagedAgent): CodexProLogger {
+    const pageId = (agent.session as AgentSession & { pageId?: unknown }).pageId;
+    return this.logger.child({
+      agent_id: agent.id,
+      role: agent.role,
+      backend: agent.backend,
+      model: agent.model,
+      workspace_root: agent.workspaceRoot,
+      backend_session_id: agent.session.id,
+      ...(typeof pageId === "string" ? { page_id: pageId } : {})
+    });
+  }
+
+  private startRun(agent: ManagedAgent, prompt: string, reason: "spawn" | "followup"): void {
     if (this.runs.has(agent.id)) throw new CodexProError("subagent already has an active request");
     const controller = new AbortController();
     this.runs.set(agent.id, controller);
     agent.state = "running";
     agent.error = undefined;
+    const logger = this.agentLogger(agent);
+    logger.info("subagent_run_started", { reason, ...this.counts() });
     void this.runAgent(agent, prompt, controller).catch((error) => {
       if (agent.state !== "cancelled") {
         agent.state = "failed";
         agent.error = redactSensitiveText(error instanceof Error ? error.message : String(error));
+        logger.error("subagent_run_failed", error, { reason, ...this.counts() });
       }
     }).finally(() => {
       if (this.runs.get(agent.id) === controller) this.runs.delete(agent.id);
+      logger.info("subagent_run_cleanup", { reason, state: agent.state, ...this.counts() });
     });
   }
 
   private async runAgent(agent: ManagedAgent, prompt: string, controller: AbortController): Promise<void> {
+    const logger = this.agentLogger(agent);
     try {
+      const sendStarted = Date.now();
+      logger.info("subagent_backend_send_started", this.counts());
       const response = await this.backend.send(agent.session, prompt, controller.signal);
+      logger.info("subagent_backend_send_completed", {
+        duration_ms: Date.now() - sendStarted,
+        response_chars: response.content.length,
+        ...this.counts()
+      });
       if (controller.signal.aborted || agent.state === "cancelled") return;
+      logger.debug("subagent_result_parse_started");
       agent.result = parseResult(response.content, agent.worktree);
+      logger.debug("subagent_result_parse_completed");
       if (agent.worktree) {
-        const patch = applyImplementerPatch(agent.worktree, response.content);
-        agent.result.commandsRun.push({ command: "git apply --check && git apply", note: patch.note });
-        Object.assign(agent.result, worktreeEvidence(agent.worktree));
+        try {
+          const patch = applyImplementerPatch(agent.worktree, response.content);
+          agent.result.commandsRun.push({ command: "git apply --check && git apply", note: patch.note });
+          logger.info("subagent_worktree_patch_application", { applied: patch.applied });
+          Object.assign(agent.result, worktreeEvidence(agent.worktree));
+          logger.info("subagent_worktree_evidence_collected", { changed_file_count: agent.result.changedFiles.length });
+        } catch (error) {
+          logger.error("subagent_worktree_patch_application_failed", error);
+          throw error;
+        }
       }
-      if (!controller.signal.aborted) agent.state = "completed";
+      if (!controller.signal.aborted) {
+        agent.state = "completed";
+        logger.info("subagent_run_completed", { changed_file_count: agent.result.changedFiles.length, ...this.counts() });
+      }
     } catch (error) {
       if (controller.signal.aborted || agent.state === "cancelled") return;
       throw error;
@@ -157,13 +209,46 @@ export class AgentManager {
   }
 
   async spawn(workspace: Workspace, options: { task: string; role: AgentRole; paths?: string[]; context?: string; parentId?: string }): Promise<ManagedAgent> {
+    this.logger.info("subagent_spawn_requested", {
+      role: options.role,
+      backend: this.backend.name,
+      model: this.backend.model,
+      workspace_root: workspace.root,
+      workspace_handle: workspace.id,
+      parent_agent_id: options.parentId ?? null,
+      ...this.counts()
+    });
     if (!this.config.subagentsEnabled) throw new CodexProError("subagents are disabled");
-    if (this.runningCount() + this.pendingSpawns >= this.config.maxSubagents) throw new CodexProError(`maximum concurrent subagents reached (${this.config.maxSubagents})`);
+    if (this.runningCount() + this.pendingSpawns >= this.config.maxSubagents) {
+      this.logger.warn("subagent_spawn_rejected_max_concurrency", {
+        role: options.role,
+        backend: this.backend.name,
+        max_subagents: this.config.maxSubagents,
+        workspace_root: workspace.root,
+        ...this.counts()
+      });
+      throw new CodexProError(`maximum concurrent subagents reached (${this.config.maxSubagents})`);
+    }
     if (options.parentId) throw new CodexProError(`recursive subagent spawning is disabled at the tool layer (max depth ${this.config.maxAgentDepth})`);
     if (!options.task.trim()) throw new CodexProError("subagent task is required");
     this.pendingSpawns += 1;
+    this.logger.info("subagent_concurrency_slot_reserved", {
+      role: options.role,
+      backend: this.backend.name,
+      max_subagents: this.config.maxSubagents,
+      ...this.counts()
+    });
     try {
       const id = `agent-${randomUUID().slice(0, 8)}`;
+      const spawnLogger = this.logger.child({
+        agent_id: id,
+        role: options.role,
+        backend: this.backend.name,
+        model: this.backend.model,
+        workspace_root: workspace.root,
+        workspace_handle: workspace.id,
+        parent_agent_id: options.parentId ?? null
+      });
       const paths = (options.paths ?? []).slice(0, 20).filter((rel) => !SENSITIVE_PATH.test(rel.replaceAll("\\", "/")));
       const instructions = await instructionResolver.resolve(this.config, this.guard, workspace, paths[0] ?? ".", { maxBytes: 20_000 });
       const contextChunks: string[] = [];
@@ -191,7 +276,20 @@ export class AgentManager {
         contextChunks.length ? `SCOPED FILE CONTEXT:\n${contextChunks.join("\n\n")}` : "No repository file contents were delegated.",
         "Return: summary, findings with evidence, proposed/actual changes, commands/tests you believe the parent should verify, and unresolved questions."
       ].filter(Boolean).join("\n\n");
-      const session = await this.backend.create({ id, role: options.role, task: "", systemPrompt, model: this.backend.model });
+      spawnLogger.info("subagent_backend_session_creation_started", this.counts());
+      let session: AgentSession;
+      try {
+        session = await this.backend.create({ id, role: options.role, task: "", systemPrompt, model: this.backend.model });
+      } catch (error) {
+        spawnLogger.error("subagent_backend_session_creation_failed", error, this.counts());
+        throw error;
+      }
+      const pageId = (session as AgentSession & { pageId?: unknown }).pageId;
+      spawnLogger.info("subagent_backend_session_creation_completed", {
+        backend_session_id: session.id,
+        ...(typeof pageId === "string" ? { page_id: pageId } : {}),
+        ...this.counts()
+      });
       const agent: ManagedAgent = {
         id,
         role: options.role,
@@ -206,10 +304,20 @@ export class AgentManager {
         session
       };
       this.agents.set(id, agent);
-      this.startRun(agent, taskPrompt);
+      this.agentLogger(agent).info("subagent_registered", this.counts());
+      this.startRun(agent, taskPrompt, "spawn");
       return this.get(id);
+    } catch (error) {
+      this.logger.error("subagent_spawn_failed", error, {
+        role: options.role,
+        backend: this.backend.name,
+        workspace_root: workspace.root,
+        ...this.counts()
+      });
+      throw error;
     } finally {
       this.pendingSpawns -= 1;
+      this.logger.info("subagent_concurrency_slot_released", this.counts());
     }
   }
 
@@ -217,20 +325,37 @@ export class AgentManager {
     const agent = this.get(id);
     if (agent.state === "cancelled") throw new CodexProError("subagent is cancelled");
     if (this.runs.has(id)) throw new CodexProError("subagent is still running; wait for completion before sending a follow-up");
-    this.startRun(agent, redactSensitiveText(message));
+    this.agentLogger(agent).info("subagent_followup_started", this.counts());
+    this.startRun(agent, redactSensitiveText(message), "followup");
     return this.get(id);
   }
 
   async cancel(id: string): Promise<ManagedAgent> {
     const agent = this.get(id);
+    const logger = this.agentLogger(agent);
+    logger.info("subagent_cancellation_requested", this.counts());
     this.runs.get(id)?.abort();
-    await this.backend.cancel(agent.session.id);
-    agent.state = "cancelled";
-    return this.get(id);
+    try {
+      await this.backend.cancel(agent.session.id);
+      agent.state = "cancelled";
+      logger.info("subagent_cancellation_completed", this.counts());
+      return this.get(id);
+    } catch (error) {
+      logger.error("subagent_cancellation_failed", error, this.counts());
+      throw error;
+    }
   }
 
   cleanup(workspace: Workspace, id: string): void {
     const agent = this.get(id);
-    if (agent.worktree) this.worktrees.remove(workspace, agent.worktree.id, { discardChanges: true });
+    const logger = this.agentLogger(agent);
+    logger.info("subagent_cleanup_started", { has_worktree: Boolean(agent.worktree), ...this.counts() });
+    try {
+      if (agent.worktree) this.worktrees.remove(workspace, agent.worktree.id, { discardChanges: true });
+      logger.info("subagent_cleanup_completed", this.counts());
+    } catch (error) {
+      logger.error("subagent_cleanup_failed", error, this.counts());
+      throw error;
+    }
   }
 }

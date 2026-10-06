@@ -285,6 +285,21 @@ try {
   if (authorizedJson.authRequired !== true) {
     throw new Error(`expected authenticated healthz to report authRequired=true, got ${JSON.stringify(authorizedJson)}`);
   }
+  if (!authorizedJson.logs?.runId || !authorizedJson.logs?.runDir) {
+    throw new Error(`expected healthz to report persistent log location, got ${JSON.stringify(authorizedJson.logs)}`);
+  }
+  await fs.stat(authorizedJson.logs.runDir);
+
+  const logsResponse = await fetch(`${baseUrl}/admin/logs`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  const logsJson = await logsResponse.json();
+  if (logsResponse.status !== 200 || logsJson.runId !== authorizedJson.logs.runId || !Array.isArray(logsJson.entries)) {
+    throw new Error(`expected admin logs snapshot, got ${logsResponse.status} ${JSON.stringify(logsJson)}`);
+  }
+  if (!logsJson.entries.some((entry) => entry.event === 'runtime_start')) {
+    throw new Error('admin logs snapshot did not include runtime_start');
+  }
 
   for (const header of [`bearer ${token}`, `Bearer    ${token}`]) {
     const variant = await fetch(`${baseUrl}/healthz`, {
@@ -367,6 +382,9 @@ try {
   }
   if (!homeText.includes('Connection profile') || !homeText.includes('data-profile-form')) {
     throw new Error('onboarding page did not include the saved profile editor');
+  }
+  if (!homeText.includes('Runtime logs') || !homeText.includes('data-log-view') || !homeText.includes(authorizedJson.logs.runDir)) {
+    throw new Error('onboarding page did not include the persistent runtime log viewer and path');
   }
   if (!homeText.includes('history.replaceState') || !homeText.includes('initialUrl.searchParams.delete("codexpro_token")')) {
     throw new Error('onboarding page did not remove query credentials from browser history');
@@ -525,7 +543,10 @@ try {
   }
 
   const mcpUrl = `${baseUrl}/mcp?codexpro_token=${encodeURIComponent(token)}`;
-  await withClient(mcpUrl, async (firstClient) => {
+  let correlatedSessionId = '';
+  await withClient(mcpUrl, async (firstClient, firstTransport) => {
+    correlatedSessionId = firstTransport.sessionId ?? '';
+    if (!correlatedSessionId) throw new Error('first HTTP MCP client did not receive a session id');
     const opened = await callTool(firstClient, 'open_current_workspace', { include_tree: false });
     const changes = await callTool(firstClient, 'show_changes', {
       workspace_id: opened.structuredContent.workspace_id,
@@ -535,6 +556,21 @@ try {
       throw new Error(`first HTTP session did not receive its workspace changes: ${JSON.stringify(changes.structuredContent)}`);
     }
   });
+  const correlatedLogEntries = [];
+  for (const name of await fs.readdir(authorizedJson.logs.runDir)) {
+    if (!/^codexpro-\d+(?:\.\d+)?\.jsonl$/.test(name)) continue;
+    const text = await fs.readFile(path.join(authorizedJson.logs.runDir, name), 'utf8');
+    for (const line of text.split(/\r?\n/).filter(Boolean)) correlatedLogEntries.push(JSON.parse(line));
+  }
+  const correlatedTool = correlatedLogEntries.find((entry) =>
+    entry.event === 'mcp_tool_completed' &&
+    entry.tool === 'open_current_workspace' &&
+    entry.mcp_session_id === correlatedSessionId
+  );
+  if (!correlatedTool?.tool_call_id) {
+    throw new Error('persistent logs did not correlate MCP session, tool, and tool_call_id');
+  }
+
   await withClient(mcpUrl, async (secondClient) => {
     const opened = await callTool(secondClient, 'open_current_workspace', { include_tree: false });
     const changes = await callTool(secondClient, 'show_changes', {

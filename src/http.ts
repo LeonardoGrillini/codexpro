@@ -21,6 +21,8 @@ import {
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import { ChatGPTBrowserManager } from "./chatgptBrowserManager.js";
 import { createCodexProServer } from "./server.js";
+import type { LogSnapshot } from "./logging.js";
+import { createCodexProLogger, withLogContext } from "./logging.js";
 import { CODEXPRO_VERSION } from "./version.js";
 
 function escapeHtml(value: unknown): string {
@@ -432,7 +434,8 @@ For trusted local-only testing, set CODEXPRO_ALLOW_NO_HTTP_TOKEN=1.
 Most users should run: codexpro start`);
 }
 
-function onboardingPage(config: CodexProConfig): string {
+function onboardingPage(config: CodexProConfig, logs: LogSnapshot): string {
+  const logPreview = logs.entries.slice(-200).map((entry) => escapeHtml(JSON.stringify(entry))).join("\n");
   const localMcp = `http://${config.host}:${config.port}/mcp`;
   const localMcpDisplay = config.authToken ? `${localMcp}?codexpro_token=<redacted>` : localMcp;
   const allowedRoots = config.allowedRoots.map((root) => `<li>${escapeHtml(root)}</li>`).join("");
@@ -1293,11 +1296,26 @@ function onboardingPage(config: CodexProConfig): string {
           <ul class="scope-list">
             <li><strong>/setup</strong><span>this setup and settings page</span></li>
             <li><strong>/admin/profile</strong><span>saved workspace profile API</span></li>
+            <li><strong>/admin/logs</strong><span>redacted runtime log tail and file locations</span></li>
             <li><strong>/healthz</strong><span>authenticated status check</span></li>
             <li><strong>/mcp</strong><span>MCP endpoint for ChatGPT and local clients</span></li>
           </ul>
         </section>
       </aside>
+    </section>
+    <section class="panel details-panel" id="logs">
+      <div class="section-head">
+        <div>
+          <h2>Runtime logs</h2>
+          <p>Persistent, redacted JSONL for this run. Use these records to correlate MCP sessions, tools, subagents, Chrome/CDP, pages, and process lifecycle.</p>
+        </div>
+        <button type="button" class="copy-mini" data-log-refresh>Refresh</button>
+      </div>
+      <div class="controls">
+        <div class="control"><div><strong>Run ID</strong><p data-log-run-id>${escapeHtml(logs.runId)}</p></div></div>
+        <div class="control"><div><strong>Log directory</strong><p data-log-run-dir>${escapeHtml(logs.runDir)}</p></div></div>
+      </div>
+      <pre data-log-view style="max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:var(--color-panel-2);border:1px solid var(--color-rule);border-radius:var(--radius-1);padding:var(--space-4);font:12px/1.5 var(--font-mono);">${logPreview || "No log entries yet."}</pre>
     </section>
     <section class="panel cli-panel details-panel" id="cli">
       <div class="section-head">
@@ -1343,6 +1361,28 @@ function onboardingPage(config: CodexProConfig): string {
         }
       });
     });
+    const logRefresh = document.querySelector("[data-log-refresh]");
+    if (logRefresh) {
+      logRefresh.addEventListener("click", async () => {
+        logRefresh.textContent = "Refreshing...";
+        try {
+          const suffix = connectorToken ? "?codexpro_token=" + encodeURIComponent(connectorToken) : "";
+          const response = await fetch("/admin/logs" + suffix);
+          const snapshot = await response.json();
+          if (!response.ok) throw new Error(snapshot.error?.message || "Log refresh failed");
+          const runId = document.querySelector("[data-log-run-id]");
+          const runDir = document.querySelector("[data-log-run-dir]");
+          const view = document.querySelector("[data-log-view]");
+          if (runId) runId.textContent = snapshot.runId || "";
+          if (runDir) runDir.textContent = snapshot.runDir || "";
+          if (view) view.textContent = (snapshot.entries || []).map((entry) => JSON.stringify(entry)).join("\\n") || "No log entries yet.";
+          logRefresh.textContent = "Refreshed";
+        } catch {
+          logRefresh.textContent = "Refresh failed";
+        }
+        setTimeout(() => { logRefresh.textContent = "Refresh"; }, 1400);
+      });
+    }
     const profileForm = document.querySelector("[data-profile-form]");
     const tunnelSelect = document.querySelector("[data-tunnel-select]");
     const hostnameInput = document.querySelector("[data-hostname-input]");
@@ -1446,9 +1486,15 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
-  const chatgptBrowserManager = new ChatGPTBrowserManager(config);
+  const logger = createCodexProLogger({ workspaceRoot: config.defaultRoot, component: "http" });
+  logger.info("runtime_start", { transport: "http", host: config.host, port: config.port, log_dir: logger.runDir });
+  process.on("uncaughtExceptionMonitor", (error, origin) => {
+    logger.error("runtime_uncaught_exception", error, { origin });
+  });
+  const chatgptBrowserManager = new ChatGPTBrowserManager(config, undefined, undefined, { logger: logger.child({ subsystem: "chatgpt_browser" }) });
   if (config.chatgptBrowserAutoStart) {
     void chatgptBrowserManager.openOrFocus().catch((error) => {
+      logger.error("chatgpt_browser_auto_start_failed", error);
       console.error(`[CodexPro] ChatGPT browser auto-start failed: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`);
     });
   }
@@ -1501,16 +1547,23 @@ async function main(): Promise<void> {
   }
 
   app.use((req, res, next) => {
-    if (!logRequests) {
+    const requestId = randomUUID();
+    const sessionId = requestSessionId(req);
+    withLogContext({
+      request_id: requestId,
+      ...(sessionId ? { mcp_session_id: sessionId } : {}),
+      http_method: req.method,
+      http_path: req.path
+    }, () => {
+      const started = Date.now();
+      logger.info("http_request_started");
+      if (logRequests) console.error(`[CodexPro] ${req.method} ${req.path} received`);
+      res.on("finish", () => {
+        logger.info("http_request_completed", { status_code: res.statusCode, duration_ms: Date.now() - started });
+        if (logRequests) console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms`);
+      });
       next();
-      return;
-    }
-    const started = Date.now();
-    console.error(`[CodexPro] ${req.method} ${req.path} received`);
-    res.on("finish", () => {
-      console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms`);
     });
-    next();
   });
   app.use(cors({ exposedHeaders: ["Mcp-Session-Id"] }));
   app.get("/favicon.ico", (_req, res) => {
@@ -1566,6 +1619,8 @@ async function main(): Promise<void> {
     transport: StreamableHTTPServerTransport;
     createdAt: number;
     lastSeenAt: number;
+    sessionId?: string;
+    closed?: boolean;
   };
 
   const transports = new Map<string, TransportRecord>();
@@ -1592,8 +1647,14 @@ async function main(): Promise<void> {
     });
   }
 
-  function closeTransport(record: TransportRecord): void {
-    void record.transport.close?.();
+  function closeTransport(record: TransportRecord, reason: string): void {
+    if (record.closed) return;
+    record.closed = true;
+    const transportLogger = logger.child({ mcp_session_id: record.sessionId ?? "uninitialized" });
+    transportLogger.info("mcp_transport_close_requested", { reason, active_transport_count: transports.size });
+    void Promise.resolve(record.transport.close?.())
+      .then(() => transportLogger.info("mcp_transport_closed", { reason, active_transport_count: transports.size }))
+      .catch((error) => transportLogger.error("mcp_transport_close_failed", error, { reason }));
   }
 
   function pruneTransports(): void {
@@ -1601,14 +1662,16 @@ async function main(): Promise<void> {
     for (const [sessionId, record] of transports) {
       if (now - record.lastSeenAt > config.httpSessionTtlMs) {
         transports.delete(sessionId);
-        closeTransport(record);
+        logger.warn("mcp_transport_pruned", { mcp_session_id: sessionId, reason: "ttl", idle_ms: now - record.lastSeenAt, active_transport_count: transports.size });
+        closeTransport(record, "ttl");
       }
     }
     while (transports.size > config.maxHttpSessions) {
       const oldest = [...transports.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt)[0];
       if (!oldest) break;
       transports.delete(oldest[0]);
-      closeTransport(oldest[1]);
+      logger.warn("mcp_transport_pruned", { mcp_session_id: oldest[0], reason: "capacity", active_transport_count: transports.size });
+      closeTransport(oldest[1], "capacity");
     }
   }
 
@@ -1625,11 +1688,11 @@ async function main(): Promise<void> {
   pruneTimer.unref();
 
   app.get("/", (_req, res) => {
-    res.type("html").send(onboardingPage(config));
+    res.type("html").send(onboardingPage(config, logger.snapshot({ maxLines: 200, maxBytes: 512 * 1024 })));
   });
 
   app.get("/setup", (_req, res) => {
-    res.type("html").send(onboardingPage(config));
+    res.type("html").send(onboardingPage(config, logger.snapshot({ maxLines: 200, maxBytes: 512 * 1024 })));
   });
 
   app.get("/healthz", (_req, res) => {
@@ -1648,8 +1711,13 @@ async function main(): Promise<void> {
       widgetDomain: config.widgetDomain,
       contextDir: config.contextDir,
       authEnabled: Boolean(config.authToken),
-      authRequired: Boolean(config.authToken)
+      authRequired: Boolean(config.authToken),
+      logs: { runId: logger.runId, runDir: logger.runDir }
     });
+  });
+
+  app.get("/admin/logs", (_req, res) => {
+    res.json(logger.snapshot({ maxLines: 400, maxBytes: 1024 * 1024 }));
   });
 
   app.get("/admin/profile", (_req, res) => {
@@ -1703,6 +1771,7 @@ async function main(): Promise<void> {
       const existingTransport = getTransport(sessionId);
       if (existingTransport) {
         transport = existingTransport;
+        logger.info("mcp_transport_reused", { mcp_session_id: sessionId, active_transport_count: transports.size });
       } else if (!sessionId && isInitializeRequest(req.body)) {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
@@ -1711,18 +1780,25 @@ async function main(): Promise<void> {
             transports.set(newSessionId, {
               transport,
               createdAt: Date.now(),
-              lastSeenAt: Date.now()
+              lastSeenAt: Date.now(),
+              sessionId: newSessionId,
+              closed: false
             });
+            logger.info("mcp_transport_session_initialized", { mcp_session_id: newSessionId, active_transport_count: transports.size });
             pruneTransports();
           }
         } as any);
 
         (transport as any).onclose = () => {
           const closedSessionId = (transport as any).sessionId;
+          const record = closedSessionId ? transports.get(closedSessionId) : undefined;
+          if (record) record.closed = true;
           if (closedSessionId) transports.delete(closedSessionId);
+          logger.warn("mcp_transport_closed_by_sdk", { mcp_session_id: closedSessionId ?? null, active_transport_count: transports.size });
         };
 
-        const server = createCodexProServer(config, knownWorkspaceRoots, { chatgptBrowserManager });
+        const server = createCodexProServer(config, knownWorkspaceRoots, { chatgptBrowserManager, logger });
+        logger.info("mcp_transport_created", { active_transport_count: transports.size });
         await server.connect(transport);
       } else {
         sendSessionError(res, sessionId);
@@ -1731,6 +1807,7 @@ async function main(): Promise<void> {
 
       await transport.handleRequest(req, res, req.body);
     } catch (error) {
+      logger.error("mcp_request_failed", error, { mcp_session_id: requestSessionId(req) ?? null });
       console.error(error instanceof Error ? error.stack ?? error.message : String(error));
       if (!res.headersSent) {
         res.status(500).json({
@@ -1749,6 +1826,7 @@ async function main(): Promise<void> {
       sendSessionError(res, sessionId);
       return;
     }
+    logger.info("mcp_transport_session_request", { mcp_session_id: sessionId, method: req.method });
     await transport.handleRequest(req, res);
   };
 
@@ -1766,6 +1844,7 @@ async function main(): Promise<void> {
       return;
     }
     const status = type === "entity.too.large" ? 413 : 400;
+    logger.warn("http_request_body_rejected", { error_type: type, status_code: status, path: req.path });
     if (req.path === "/mcp") {
       res.status(status).json({
         jsonrpc: "2.0",
@@ -1790,7 +1869,9 @@ async function main(): Promise<void> {
   });
 
   const httpServer = app.listen(config.port, config.host, () => {
+    logger.info("runtime_listening", { host: config.host, port: config.port, log_dir: logger.runDir });
     console.error(`[CodexPro] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);
+    console.error(`[CodexPro] logs=${logger.runDir}`);
     console.error(`[CodexPro] defaultRoot=${config.defaultRoot}`);
     console.error(`[CodexPro] allowedRoots=${config.allowedRoots.join(", ")}`);
     console.error(`[CodexPro] bashMode=${config.bashMode}`);
@@ -1802,10 +1883,17 @@ async function main(): Promise<void> {
   const shutdown = async (exitCode: number): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
-    await chatgptBrowserManager.closeAll().catch(() => undefined);
-    httpServer.close(() => process.exit(exitCode));
+    logger.info("runtime_shutdown_requested", { exit_code: exitCode, active_transport_count: transports.size });
+    for (const record of transports.values()) closeTransport(record, "runtime_shutdown");
+    transports.clear();
+    await chatgptBrowserManager.closeAll().catch((error) => logger.error("chatgpt_browser_shutdown_failed", error));
+    httpServer.close(() => {
+      logger.info("http_server_closed", { exit_code: exitCode });
+      process.exit(exitCode);
+    });
     setTimeout(() => process.exit(exitCode), 2_000).unref();
   };
+  process.once("exit", (code) => logger.info("runtime_process_exit", { exit_code: code }));
   process.once("SIGINT", () => { void shutdown(130); });
   process.once("SIGTERM", () => { void shutdown(143); });
 }

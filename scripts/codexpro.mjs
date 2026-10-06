@@ -1446,6 +1446,19 @@ function openUrl(url) {
   return result.status === 0;
 }
 
+function openLocalPath(target) {
+  const command =
+    process.platform === 'darwin'
+      ? ['open', [target]]
+      : process.platform === 'win32'
+        ? ['explorer.exe', [target]]
+        : ['xdg-open', [target]];
+  const [bin, args] = command;
+  if (process.platform !== 'win32' && !commandExists(bin)) return false;
+  const result = spawnSync(bin, args, { stdio: 'ignore', shell: false });
+  return result.status === 0;
+}
+
 function waitForProcessExit(child) {
   return new Promise((resolve) => {
     child.once('exit', (code, signal) => resolve({ code, signal }));
@@ -2942,7 +2955,7 @@ function printConnectorBlock(endpoint, token, options = {}) {
     console.log(`CODEXPRO_READY ${serverUrl}`);
   } else {
     console.log('Next: press Enter to open ChatGPT, paste the copied Server URL, choose Authentication: None.');
-    console.log('Keys: Enter connector | b ChatGPT browser | c copy | o status | h help | q quit');
+    console.log('Keys: Enter connector | b ChatGPT browser | c copy | o status | l logs | h help | q quit');
   }
   return { ...details, copied, opened, mode, toolMode: options.toolMode ?? 'standard' };
 }
@@ -2955,6 +2968,7 @@ function printControlHelp() {
   console.log('  c      copy Server URL again');
   console.log('  u      print Server URL only');
   console.log('  o      open local setup/status page');
+  console.log('  l      open and print persistent log directory');
   console.log('  p      print Create App fields');
   console.log('  m      print mode help');
   console.log('  h      show controls');
@@ -3832,6 +3846,20 @@ async function runSettings(argv) {
   }
 }
 
+async function runtimeLogLocation(details) {
+  if (!details.localStatusUrl) throw new Error('No local status page URL is available for this run.');
+  const url = new URL(details.localStatusUrl);
+  url.pathname = '/healthz';
+  url.hash = '';
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Local status request failed with HTTP ${response.status}.`);
+  const health = await response.json();
+  const runDir = typeof health?.logs?.runDir === 'string' ? health.logs.runDir : '';
+  const runId = typeof health?.logs?.runId === 'string' ? health.logs.runId : '';
+  if (!runDir) throw new Error('The running CodexPro process did not report a log directory.');
+  return { runDir, runId };
+}
+
 function writeControlPrompt() {
   process.stdout.write('codexpro> ');
 }
@@ -3893,6 +3921,18 @@ function runControlPanel(details, cleanup = cleanupChildren) {
           console.log(opened ? '\nOpened local CodexPro setup/status page.' : `\nCould not open automatically. Open this URL:\n${details.localStatusUrl}`);
         }
         writeControlPrompt();
+      } else if (normalized === 'l') {
+        console.log('\nLocating persistent CodexPro logs...');
+        void runtimeLogLocation(details).then(({ runDir, runId }) => {
+          const opened = openLocalPath(runDir);
+          console.log(`Logs: ${runDir}`);
+          if (runId) console.log(`Run:  ${runId}`);
+          if (!opened) console.log('Could not open the log directory automatically; use the path above.');
+          writeControlPrompt();
+        }).catch((error) => {
+          console.log(`Could not locate logs: ${error instanceof Error ? error.message : String(error)}`);
+          writeControlPrompt();
+        });
       } else if (normalized === 'p') {
         console.log('');
         printCreateAppFields(details);

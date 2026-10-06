@@ -4,6 +4,8 @@ import path from "node:path";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import type { CodexProConfig } from "./config.js";
 import { CodexProError } from "./guard.js";
+import type { CodexProLogger } from "./logging.js";
+import { noopLogger } from "./logging.js";
 import { redactSensitiveText } from "./redact.js";
 
 const CHATGPT_HOME = "https://chatgpt.com/";
@@ -33,6 +35,7 @@ export interface ChatGPTBrowserManagerDependencies {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   cdpReadyTimeoutMs?: number;
+  logger?: CodexProLogger;
 }
 
 function envValue(env: NodeJS.ProcessEnv, key: string, platform: NodeJS.Platform): string | undefined {
@@ -340,6 +343,7 @@ export class ChatGPTBrowserManager {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
   private readonly cdpReadyTimeoutMs: number;
+  private readonly logger: CodexProLogger;
 
   constructor(
     private readonly config: CodexProConfig,
@@ -354,6 +358,7 @@ export class ChatGPTBrowserManager {
     this.sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.now = dependencies.now ?? Date.now;
     this.cdpReadyTimeoutMs = dependencies.cdpReadyTimeoutMs ?? DEFAULT_CDP_READY_TIMEOUT_MS;
+    this.logger = dependencies.logger ?? noopLogger;
   }
 
   isRunning(): boolean { return this.state === "attached"; }
@@ -363,17 +368,43 @@ export class ChatGPTBrowserManager {
     return Boolean(this.chromeProcess && this.chromeProcess.exitCode === null && !this.chromeProcess.killed);
   }
 
+  private browserState(): Record<string, unknown> {
+    return {
+      browser_state: this.state,
+      chrome_running: this.childIsRunning(),
+      chrome_pid: this.chromeProcess?.pid ?? null,
+      owns_chrome_process: this.ownsChromeProcess,
+      cdp_port: this.debuggingPort ?? null,
+      browser_attached: Boolean(this.browser),
+      context_attached: Boolean(this.context),
+      page_count: this.pages.size,
+      active_page_ids: [...this.pages.keys()],
+      manually_closed_page_count: this.manuallyClosedPageIds.size,
+      starting: Boolean(this.starting),
+      attaching: Boolean(this.attaching)
+    };
+  }
+
+  private setState(next: ChatGPTBrowserState, event: string, fields: Record<string, unknown> = {}): void {
+    const previous = this.state;
+    this.state = next;
+    this.logger.info(event, { state_before: previous, state_after: next, ...this.browserState(), ...fields });
+  }
+
   private clearAttachment(browser?: any): void {
     if (browser && this.browser !== browser) return;
+    const before = this.browserState();
     this.browser = undefined;
     this.context = undefined;
     this.pages.clear();
     this.manuallyClosedPageIds.clear();
     if (this.state !== "stopped" && this.state !== "failed") this.state = "running-unattached";
+    this.logger.warn("chatgpt_browser_attachment_cleared", { state_before_snapshot: before, ...this.browserState() });
   }
 
-  private handleChromeExit(child: ChildProcess): void {
+  private handleChromeExit(child: ChildProcess, code: number | null, signal: NodeJS.Signals | null): void {
     if (this.chromeProcess !== child) return;
+    const before = this.browserState();
     this.chromeProcess = undefined;
     this.chromeProcessError = undefined;
     this.ownsChromeProcess = false;
@@ -383,37 +414,59 @@ export class ChatGPTBrowserManager {
     this.pages.clear();
     this.manuallyClosedPageIds.clear();
     this.state = "stopped";
+    this.logger.warn("chatgpt_browser_chrome_process_exit", {
+      exit_code: code,
+      signal,
+      state_before_snapshot: before,
+      ...this.browserState()
+    });
   }
 
   private async waitForCdp(child?: ChildProcess): Promise<number> {
-    const deadline = this.now() + this.cdpReadyTimeoutMs;
-    while (this.now() < deadline) {
-      if (child && this.chromeProcessError) {
-        throw new CodexProError(`Chrome failed before its local debugging endpoint became ready: ${errorText(this.chromeProcessError)}`);
+    const startedAt = this.now();
+    const deadline = startedAt + this.cdpReadyTimeoutMs;
+    this.logger.info("chatgpt_browser_cdp_wait_started", { timeout_ms: this.cdpReadyTimeoutMs, ...this.browserState() });
+    try {
+      while (this.now() < deadline) {
+        if (child && this.chromeProcessError) {
+          throw new CodexProError(`Chrome failed before its local debugging endpoint became ready: ${errorText(this.chromeProcessError)}`);
+        }
+        if (child && child.exitCode !== null) {
+          throw new CodexProError(`Chrome exited before its local debugging endpoint became ready (exit code ${child.exitCode}).`);
+        }
+        const port = await this.readDebuggingPort(this.config.chatgptBrowserProfilePath);
+        if (port && await this.probeDebuggingPort(port)) {
+          this.logger.info("chatgpt_browser_cdp_wait_succeeded", { cdp_port: port, duration_ms: this.now() - startedAt, ...this.browserState() });
+          return port;
+        }
+        await this.sleep(100);
       }
-      if (child && child.exitCode !== null) {
-        throw new CodexProError(`Chrome exited before its local debugging endpoint became ready (exit code ${child.exitCode}).`);
+      const timeout = new CodexProError(
+        "Timed out waiting for Chrome to expose its local debugging endpoint. Close any other Chrome using the CodexPro profile and retry."
+      );
+      this.logger.error("chatgpt_browser_cdp_wait_timeout", timeout, { duration_ms: this.now() - startedAt, ...this.browserState() });
+      throw timeout;
+    } catch (error) {
+      if (!(error instanceof CodexProError) || !error.message.startsWith("Timed out waiting for Chrome")) {
+        this.logger.error("chatgpt_browser_cdp_wait_failed", error, { duration_ms: this.now() - startedAt, ...this.browserState() });
       }
-      const port = await this.readDebuggingPort(this.config.chatgptBrowserProfilePath);
-      if (port && await this.probeDebuggingPort(port)) return port;
-      await this.sleep(100);
+      throw error;
     }
-    throw new CodexProError(
-      "Timed out waiting for Chrome to expose its local debugging endpoint. Close any other Chrome using the CodexPro profile and retry."
-    );
   }
 
   private async startInternal(): Promise<void> {
     await fsp.mkdir(this.config.chatgptBrowserProfilePath, { recursive: true, mode: 0o700 });
 
     if (this.debuggingPort && await this.probeDebuggingPort(this.debuggingPort)) {
-      this.state = this.context ? "attached" : "running-unattached";
+      const next = this.context ? "attached" : "running-unattached";
+      this.setState(next, "chatgpt_browser_existing_cdp_endpoint_reused", { cdp_port: this.debuggingPort });
       return;
     }
 
     if (this.childIsRunning()) {
+      this.logger.info("chatgpt_browser_existing_chrome_child_reused", this.browserState());
       this.debuggingPort = await this.waitForCdp(this.chromeProcess);
-      this.state = "running-unattached";
+      this.setState("running-unattached", "chatgpt_browser_child_cdp_ready", { cdp_port: this.debuggingPort });
       return;
     }
 
@@ -421,7 +474,7 @@ export class ChatGPTBrowserManager {
     if (existingPort && await this.probeDebuggingPort(existingPort)) {
       this.debuggingPort = existingPort;
       this.ownsChromeProcess = false;
-      this.state = "running-unattached";
+      this.setState("running-unattached", "chatgpt_browser_external_chrome_detected", { cdp_port: existingPort });
       return;
     }
 
@@ -435,23 +488,33 @@ export class ChatGPTBrowserManager {
     ];
 
     let child: ChildProcess;
+    this.logger.info("chatgpt_browser_chrome_spawn_requested", {
+      executable,
+      profile_path: this.config.chatgptBrowserProfilePath,
+      ...this.browserState()
+    });
     try {
-      child = this.spawnProcess(executable, args, { detached: false, stdio: "ignore", windowsHide: false });
+      child = this.spawnProcess(executable, args, { detached: false, stdio: ["ignore", "pipe", "pipe"], windowsHide: false });
     } catch (error) {
+      this.logger.error("chatgpt_browser_chrome_spawn_failed", error, this.browserState());
       throw new CodexProError(`Could not launch the installed Chrome browser: ${errorText(error)}`);
     }
     this.chromeProcess = child;
     this.chromeProcessError = undefined;
     this.ownsChromeProcess = true;
+    this.logger.info("chatgpt_browser_chrome_spawned", { chrome_pid: child.pid ?? null, ...this.browserState() });
+    this.logger.captureChildProcess(child, "chrome", { subsystem: "chatgpt_browser" }, { maxBytesPerStream: 64 * 1024, outputLevel: "debug" });
     child.once?.("error", (error) => {
       if (this.chromeProcess === child) this.chromeProcessError = error;
+      this.logger.error("chatgpt_browser_chrome_process_error", error, this.browserState());
     });
-    child.once?.("exit", () => this.handleChromeExit(child));
+    child.once?.("exit", (code, signal) => this.handleChromeExit(child, code, signal));
 
     try {
       this.debuggingPort = await this.waitForCdp(child);
-      this.state = "running-unattached";
+      this.setState("running-unattached", "chatgpt_browser_chrome_cdp_ready", { cdp_port: this.debuggingPort });
     } catch (error) {
+      this.logger.error("chatgpt_browser_chrome_start_failed", error, this.browserState());
       if (this.chromeProcess === child && child.exitCode === null && !child.killed) {
         try { child.kill(); } catch {}
       }
@@ -464,15 +527,20 @@ export class ChatGPTBrowserManager {
   }
 
   async start(): Promise<void> {
+    this.logger.info("chatgpt_browser_start_requested", this.browserState());
     if (this.context && this.browser) {
-      this.state = "attached";
+      this.setState("attached", "chatgpt_browser_start_reused_attachment");
       return;
     }
-    if (this.starting) return this.starting;
-    this.state = "starting";
+    if (this.starting) {
+      this.logger.info("chatgpt_browser_start_joined_existing", this.browserState());
+      return this.starting;
+    }
+    this.setState("starting", "chatgpt_browser_starting");
     this.starting = this.startInternal()
       .catch((error) => {
-        this.state = "failed";
+        this.logger.error("chatgpt_browser_start_failed", error, this.browserState());
+        this.setState("failed", "chatgpt_browser_state_failed");
         if (error instanceof CodexProError) throw error;
         throw new CodexProError(`Could not start the dedicated ChatGPT Chrome profile: ${errorText(error)}`);
       })
@@ -483,17 +551,25 @@ export class ChatGPTBrowserManager {
   }
 
   async attach(): Promise<any> {
-    if (this.context && this.browser) return this.context;
-    if (this.attaching) return this.attaching;
+    if (this.context && this.browser) {
+      this.logger.info("chatgpt_browser_attach_reused", this.browserState());
+      return this.context;
+    }
+    if (this.attaching) {
+      this.logger.info("chatgpt_browser_attach_joined_existing", this.browserState());
+      return this.attaching;
+    }
     this.attaching = (async () => {
       await this.start();
       const port = this.debuggingPort;
       if (!port) throw new CodexProError("Chrome is running but its local debugging port is unavailable.");
+      this.logger.info("chatgpt_browser_playwright_attach_started", { cdp_port: port, ...this.browserState() });
 
       let playwright: any;
       try {
         playwright = await this.loadPlaywright();
-      } catch {
+      } catch (error) {
+        this.logger.error("chatgpt_browser_playwright_load_failed", error, this.browserState());
         throw new CodexProError("ChatGPT browser subagents require the packaged Playwright dependency and an installed Chrome browser.");
       }
 
@@ -501,21 +577,25 @@ export class ChatGPTBrowserManager {
       try {
         browser = await playwright.chromium.connectOverCDP(`http://${CDP_HOST}:${port}`);
       } catch (error) {
-        this.state = "running-unattached";
+        this.setState("running-unattached", "chatgpt_browser_playwright_attach_failed_state", { cdp_port: port });
+        this.logger.error("chatgpt_browser_playwright_attach_failed", error, { cdp_port: port, ...this.browserState() });
         throw new CodexProError(`Could not attach Playwright to the installed Chrome browser over local CDP: ${errorText(error)}`);
       }
 
       const contexts = browser.contexts?.() ?? [];
       const context = contexts[0];
       if (!context) {
-        this.state = "running-unattached";
+        this.setState("running-unattached", "chatgpt_browser_playwright_context_missing", { cdp_port: port });
         throw new CodexProError("Playwright attached to Chrome, but Chrome did not expose a usable browser context.");
       }
 
       this.browser = browser;
       this.context = context;
-      this.state = "attached";
-      browser.on?.("disconnected", () => this.clearAttachment(browser));
+      this.setState("attached", "chatgpt_browser_playwright_attach_succeeded", { cdp_port: port });
+      browser.on?.("disconnected", () => {
+        this.logger.warn("chatgpt_browser_disconnected", this.browserState());
+        this.clearAttachment(browser);
+      });
       return context;
     })().finally(() => {
       this.attaching = undefined;
@@ -541,58 +621,114 @@ export class ChatGPTBrowserManager {
   }
 
   async createAgentPage(id: string): Promise<{ pageId: string; conversationUrl?: string }> {
+    const pageLogger = this.logger.child({ agent_id: id, page_id: id });
+    pageLogger.info("chatgpt_browser_agent_page_creation_started", this.browserState());
     const existing = this.pages.get(id);
-    if (existing && !existing.page.isClosed?.()) throw new CodexProError(`ChatGPT browser page already exists for subagent ${id}`);
+    if (existing && !existing.page.isClosed?.()) {
+      pageLogger.warn("chatgpt_browser_agent_page_creation_rejected_existing", this.browserState());
+      throw new CodexProError(`ChatGPT browser page already exists for subagent ${id}`);
+    }
     if (existing) this.pages.delete(id);
     this.manuallyClosedPageIds.delete(id);
 
-    const context = await this.ensureReady();
-    const page = await context.newPage();
-    const adapter = this.adapterFactory(page, this.config.chatgptBrowserResponseTimeoutMs);
     try {
-      await adapter.prepareFreshConversation();
-      this.pages.set(id, { page, adapter });
-      page.on?.("close", () => {
-        if (this.pages.get(id)?.page === page) {
-          this.pages.delete(id);
-          this.manuallyClosedPageIds.add(id);
-        }
-      });
-      return { pageId: id, conversationUrl: conversationUrlFrom(adapter.currentUrl()) };
+      const context = await this.ensureReady();
+      const page = await context.newPage();
+      const adapter = this.adapterFactory(page, this.config.chatgptBrowserResponseTimeoutMs);
+      try {
+        await adapter.prepareFreshConversation();
+        this.pages.set(id, { page, adapter });
+        page.on?.("close", () => {
+          if (this.pages.get(id)?.page === page) {
+            this.pages.delete(id);
+            this.manuallyClosedPageIds.add(id);
+            pageLogger.warn("chatgpt_browser_agent_page_closed", { manual_or_external: true, ...this.browserState() });
+          }
+        });
+        const conversationUrl = conversationUrlFrom(adapter.currentUrl());
+        pageLogger.info("chatgpt_browser_agent_page_creation_completed", {
+          has_conversation_url: Boolean(conversationUrl),
+          ...this.browserState()
+        });
+        return { pageId: id, conversationUrl };
+      } catch (error) {
+        try { await page.close?.(); } catch {}
+        throw error;
+      }
     } catch (error) {
-      try { await page.close?.(); } catch {}
+      pageLogger.error("chatgpt_browser_agent_page_creation_failed", error, this.browserState());
       throw error;
     }
   }
 
   async send(id: string, prompt: string, signal?: AbortSignal, onConversationUrl?: (url: string) => void): Promise<{ content: string; conversationUrl?: string }> {
+    const pageLogger = this.logger.child({ agent_id: id, page_id: id });
+    const startedAt = this.now();
+    pageLogger.info("chatgpt_browser_agent_send_started", this.browserState());
     const entry = this.pages.get(id);
     if (!entry) {
       if (this.manuallyClosedPageIds.has(id)) {
+        pageLogger.warn("chatgpt_browser_agent_send_rejected_page_closed", this.browserState());
         throw new CodexProError(`The ChatGPT browser tab for subagent ${id} was closed manually.`);
       }
+      pageLogger.warn("chatgpt_browser_agent_send_rejected_page_missing", this.browserState());
       throw new CodexProError(`No ChatGPT browser tab exists for subagent ${id}`);
     }
     if (entry.page.isClosed?.()) {
       this.pages.delete(id);
       this.manuallyClosedPageIds.add(id);
+      pageLogger.warn("chatgpt_browser_agent_send_rejected_page_closed", this.browserState());
       throw new CodexProError(`The ChatGPT browser tab for subagent ${id} was closed manually.`);
     }
-    return entry.adapter.send(prompt, signal, onConversationUrl);
+    try {
+      const result = await entry.adapter.send(prompt, signal, onConversationUrl);
+      pageLogger.info("chatgpt_browser_agent_send_completed", {
+        duration_ms: this.now() - startedAt,
+        response_chars: result.content.length,
+        has_conversation_url: Boolean(result.conversationUrl),
+        ...this.browserState()
+      });
+      return result;
+    } catch (error) {
+      pageLogger.error("chatgpt_browser_agent_send_failed", error, {
+        duration_ms: this.now() - startedAt,
+        aborted: Boolean(signal?.aborted),
+        ...this.browserState()
+      });
+      throw error;
+    }
   }
 
   async cancel(id: string): Promise<void> {
+    const pageLogger = this.logger.child({ agent_id: id, page_id: id });
     const entry = this.pages.get(id);
-    if (!entry || entry.page.isClosed?.()) return;
-    await entry.adapter.cancel();
+    pageLogger.info("chatgpt_browser_agent_cancel_requested", { page_present: Boolean(entry), ...this.browserState() });
+    if (!entry || entry.page.isClosed?.()) {
+      pageLogger.info("chatgpt_browser_agent_cancel_noop", this.browserState());
+      return;
+    }
+    try {
+      await entry.adapter.cancel();
+      pageLogger.info("chatgpt_browser_agent_cancel_completed", this.browserState());
+    } catch (error) {
+      pageLogger.error("chatgpt_browser_agent_cancel_failed", error, this.browserState());
+      throw error;
+    }
   }
 
   async closeAgentPage(id: string): Promise<void> {
+    const pageLogger = this.logger.child({ agent_id: id, page_id: id });
     const entry = this.pages.get(id);
+    pageLogger.info("chatgpt_browser_agent_page_close_requested", { page_present: Boolean(entry), ...this.browserState() });
     if (!entry) return;
     this.pages.delete(id);
     this.manuallyClosedPageIds.delete(id);
-    try { await entry.page.close?.(); } catch {}
+    try {
+      await entry.page.close?.();
+      pageLogger.info("chatgpt_browser_agent_page_close_completed", this.browserState());
+    } catch (error) {
+      pageLogger.error("chatgpt_browser_agent_page_close_failed", error, this.browserState());
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -600,6 +736,8 @@ export class ChatGPTBrowserManager {
     const child = this.chromeProcess;
     const owned = this.ownsChromeProcess;
     const entries = [...this.pages.values()];
+    const before = this.browserState();
+    this.logger.info("chatgpt_browser_shutdown_requested", before);
 
     this.state = "stopped";
     this.browser = undefined;
@@ -613,16 +751,23 @@ export class ChatGPTBrowserManager {
 
     for (const entry of entries) {
       if (!entry.page.isClosed?.()) {
-        try { await entry.page.close?.(); } catch {}
+        try { await entry.page.close?.(); } catch (error) {
+          this.logger.warn("chatgpt_browser_shutdown_page_close_failed", { error: errorText(error) });
+        }
       }
     }
 
     if (owned && browser) {
-      try { await browser.close?.(); } catch {}
+      try { await browser.close?.(); } catch (error) {
+        this.logger.warn("chatgpt_browser_shutdown_browser_close_failed", { error: errorText(error) });
+      }
     }
     if (owned && child && child.exitCode === null && !child.killed) {
-      try { child.kill(); } catch {}
+      try { child.kill(); } catch (error) {
+        this.logger.warn("chatgpt_browser_shutdown_chrome_kill_failed", { error: errorText(error) });
+      }
     }
+    this.logger.info("chatgpt_browser_shutdown_completed", { state_before_snapshot: before, ...this.browserState() });
   }
 
   async closeAll(): Promise<void> {
