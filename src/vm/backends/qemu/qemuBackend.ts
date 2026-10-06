@@ -6,7 +6,8 @@ import net from "node:net";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { codexProHome } from "../../../profileStore.js";
-import { waitForGuestAgent } from "../../guestAgent.js";
+import { GuestAgentClient, waitForGuestAgent } from "../../guestAgent.js";
+import { boundedUtf8, normalizeVmExec, validateGuestFileData, VM_GUEST_FILE_CHUNK_BYTES, VM_GUEST_FILE_MAX_BYTES, type VmExecOptions, type VmExecResult, type VmGuestCredential, type VmGuestStatus } from "../../guestControl.js";
 import { ImageStore } from "../../imageStore.js";
 import { InstanceStore } from "../../instanceStore.js";
 import {
@@ -546,6 +547,133 @@ export class QemuBackend implements VmBackend {
 
   async inspectImage(name: string): Promise<VmImageManifest> {
     return this.images.readManifest(validateImageName(name), true);
+  }
+
+  private async guestRecord(id: string): Promise<VmInstanceRecord> {
+    const record = await this.instances.read(validateInstanceId(id));
+    if (record.backend !== "qemu") throw new Error("This instance requires the Hyper-V backend.");
+    if (record.state !== "running") throw new Error(`VM instance "${id}" is not running.`);
+    if (!record.processId || !this.instances.isProcessAlive(record.processId)) throw new Error(`VM instance "${id}" is not running.`);
+    if (!record.qga) throw new Error("QEMU guest agent channel is unavailable for this instance.");
+    return record;
+  }
+
+  async guestStatus(id: string, _credential?: VmGuestCredential): Promise<VmGuestStatus> {
+    const record = await this.instances.read(validateInstanceId(id));
+    if (record.backend !== "qemu") throw new Error("This instance requires the Hyper-V backend.");
+    const base = { id: record.id, backend: "qemu" as const, state: record.state, transport: "qemu-guest-agent" as const };
+    if (record.state !== "running" || !record.processId || !this.instances.isProcessAlive(record.processId)) {
+      return { ...base, available: false, canExec: false, reason: "VM is not running." };
+    }
+    if (!record.qga) return { ...base, available: false, canExec: false, reason: "QEMU guest agent channel is unavailable." };
+    let client: GuestAgentClient | undefined;
+    try {
+      client = await GuestAgentClient.connect(record.qga, 1_000);
+      const info = await client.info(1_500);
+      const command = info.supported_commands?.find((entry) => entry.name === "guest-exec");
+      if (command && !command.enabled) return { ...base, available: true, canExec: false, reason: "QEMU guest-exec is disabled by the guest administrator." };
+      return { ...base, available: true, canExec: true };
+    } catch (error) {
+      return { ...base, available: false, canExec: false, reason: error instanceof Error ? error.message : String(error) };
+    } finally {
+      client?.close();
+    }
+  }
+
+  async exec(id: string, options: VmExecOptions): Promise<VmExecResult> {
+    const record = await this.guestRecord(id);
+    const plan = normalizeVmExec(options);
+    let client: GuestAgentClient | undefined;
+    try {
+      client = await GuestAgentClient.connect(record.qga!, 1_500);
+      const pid = await client.exec(plan.executable, plan.args, plan.env, Math.min(2_000, plan.timeoutMs));
+      const deadline = Date.now() + plan.timeoutMs;
+      for (;;) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          return { exitCode: null, stdout: "", stderr: "", timedOut: true, stdoutTruncated: false, stderrTruncated: false, transport: "qemu-guest-agent" };
+        }
+        let status;
+        try {
+          status = await client.execStatus(pid, Math.min(1_500, remaining));
+        } catch (error) {
+          if (Date.now() >= deadline && error instanceof Error && /timed out/i.test(error.message)) {
+            return { exitCode: null, stdout: "", stderr: "", timedOut: true, stdoutTruncated: false, stderrTruncated: false, transport: "qemu-guest-agent" };
+          }
+          throw error;
+        }
+        if (!status.exited) {
+          await sleep(Math.min(200, Math.max(25, remaining)));
+          continue;
+        }
+        const stdout = boundedUtf8(Buffer.from(status["out-data"] ?? "", "base64"));
+        const stderr = boundedUtf8(Buffer.from(status["err-data"] ?? "", "base64"));
+        return {
+          exitCode: typeof status.exitcode === "number" ? status.exitcode : null,
+          stdout: stdout.text,
+          stderr: stderr.text,
+          timedOut: false,
+          stdoutTruncated: stdout.truncated || status["out-truncated"] === true,
+          stderrTruncated: stderr.truncated || status["err-truncated"] === true,
+          transport: "qemu-guest-agent"
+        };
+      }
+    } finally {
+      client?.close();
+    }
+  }
+
+  async upload(id: string, guestPath: string, data: Buffer, _credential?: VmGuestCredential): Promise<{ bytes: number }> {
+    const record = await this.guestRecord(id);
+    validateGuestFileData(data);
+    if (!guestPath || guestPath.length > 4096 || guestPath.includes("\0")) throw new Error("Invalid guest destination path.");
+    let client: GuestAgentClient | undefined;
+    let handle: number | undefined;
+    try {
+      client = await GuestAgentClient.connect(record.qga!, 1_500);
+      handle = await client.fileOpen(guestPath, "wb", 1_500);
+      if (!Number.isSafeInteger(handle) || handle < 0) throw new Error("QEMU guest agent returned an invalid file handle.");
+      let offset = 0;
+      while (offset < data.length) {
+        const chunk = data.subarray(offset, offset + VM_GUEST_FILE_CHUNK_BYTES);
+        const result = await client.fileWrite(handle, chunk, 2_000);
+        if (!Number.isSafeInteger(result.count) || result.count <= 0 || result.count > chunk.length) throw new Error("QEMU guest agent reported an invalid file-write count.");
+        offset += result.count;
+      }
+      await client.fileFlush(handle, 1_500);
+      return { bytes: data.length };
+    } finally {
+      if (client && handle !== undefined) await client.fileClose(handle, 1_500).catch(() => {});
+      client?.close();
+    }
+  }
+
+  async download(id: string, guestPath: string, _credential?: VmGuestCredential): Promise<Buffer> {
+    const record = await this.guestRecord(id);
+    if (!guestPath || guestPath.length > 4096 || guestPath.includes("\0")) throw new Error("Invalid guest source path.");
+    let client: GuestAgentClient | undefined;
+    let handle: number | undefined;
+    const chunks: Buffer[] = [];
+    let total = 0;
+    try {
+      client = await GuestAgentClient.connect(record.qga!, 1_500);
+      handle = await client.fileOpen(guestPath, "rb", 1_500);
+      if (!Number.isSafeInteger(handle) || handle < 0) throw new Error("QEMU guest agent returned an invalid file handle.");
+      for (;;) {
+        const result = await client.fileRead(handle, VM_GUEST_FILE_CHUNK_BYTES, 2_000);
+        const chunk = Buffer.from(result["buf-b64"] ?? "", "base64");
+        if (chunk.length !== result.count) throw new Error("QEMU guest agent returned an invalid file-read count.");
+        total += chunk.length;
+        if (total > VM_GUEST_FILE_MAX_BYTES) throw new Error(`VM guest file transfer is limited to ${VM_GUEST_FILE_MAX_BYTES} bytes per file.`);
+        chunks.push(chunk);
+        if (result.eof) break;
+        if (chunk.length === 0) throw new Error("QEMU guest agent returned a zero-byte file read before EOF.");
+      }
+      return Buffer.concat(chunks, total);
+    } finally {
+      if (client && handle !== undefined) await client.fileClose(handle, 1_500).catch(() => {});
+      client?.close();
+    }
   }
 
   vmHome(): string {

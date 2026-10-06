@@ -4,6 +4,7 @@ export * from "./qemu.js";
 export * from "./qemuProbe.js";
 export * from "./qmp.js";
 export * from "./guestAgent.js";
+export * from "./guestControl.js";
 export * from "./imageStore.js";
 export * from "./instanceStore.js";
 export * from "./vmManager.js";

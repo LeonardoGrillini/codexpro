@@ -28,7 +28,7 @@ import { ChatGPTBrowserManager } from "./chatgptBrowserManager.js";
 import { AgentManager } from "./agentManager.js";
 import type { CodexProLogger } from "./logging.js";
 import { noopLogger, withLogContext } from "./logging.js";
-import { VmManager, runVmToolAction } from "./vm/index.js";
+import { VM_GUEST_FILE_MAX_BYTES, VM_GUEST_MAX_TIMEOUT_MS, VmManager, runVmDownloadTool, runVmExecTool, runVmGuestStatusTool, runVmToolAction, runVmUploadTool } from "./vm/index.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import { RuntimeCoordinator, type RuntimeClientHandle } from "./runtimeCoordinator.js";
 
@@ -437,6 +437,10 @@ const STANDARD_TOOL_NAMES = [
   "handoff_to_agent",
   "git",
   "vm",
+  "vm_exec",
+  "vm_upload",
+  "vm_download",
+  "vm_guest_status",
   "browser"
 ] as const;
 
@@ -469,6 +473,10 @@ const FULL_TOOL_NAMES = [
   "git",
   "show_changes",
   "vm",
+  "vm_exec",
+  "vm_upload",
+  "vm_download",
+  "vm_guest_status",
   "browser",
   "subagent_spawn",
   "subagent_message",
@@ -495,6 +503,10 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "git",
   "browser",
   "vm",
+  "vm_exec",
+  "vm_upload",
+  "vm_download",
+  "vm_guest_status",
   "subagent_spawn",
   "subagent_message",
   "subagent_cancel",
@@ -614,7 +626,7 @@ function serverInstructions(config: CodexProConfig): string {
       : "5. Bash is available for normal local development commands. In safe mode catastrophic filesystem/system/destructive-Git patterns are blocked; prefer structured Git/file tools where practical.";
   const vmInstruction =
     !config.connectionTest && config.toolMode !== "minimal"
-      ? "VM runtime: the vm tool may list human-approved images and create/status/destroy disposable platform-native VM instances. It cannot import images or execute guest commands in this release. Keep host and guest evidence separate, never assume host secrets exist in a guest, and do not claim guest execution unless a future guest-execution tool returns evidence."
+      ? "VM runtime: the vm tool manages lifecycle for human-approved disposable platform-native VM instances. Use vm_guest_status, vm_exec, vm_upload, and vm_download for bounded guest control; the backend transport is selected automatically. Keep host and guest evidence separate, never assume host secrets exist in a guest, prefer argv over shell command strings, and never persist or echo operation-scoped Hyper-V guest credentials."
       : "";
 
   return [
@@ -1106,6 +1118,7 @@ const SESSION_READ_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, des
 const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
+const VM_GUEST_CREDENTIAL_SCHEMA = z.object({ username: z.string().min(1).max(256), password: z.string().min(1).max(4096) });
 
 export interface CodexProServerDependencies {
   runtimeCoordinator?: RuntimeCoordinator;
@@ -1214,8 +1227,8 @@ export function createCodexProServer(
   });
 
   registerCodexTool(config, server, "read_output", {
-    title: "Read Command Output",
-    description: "Read retained, redacted shell output by character offset. Follow next_offset until null. Last four shell outputs are retained for this logical client, up to 2 MB each; incomplete means execution hit a capture limit or timeout.",
+    title: "Read Retained Output",
+    description: "Read retained text output or payload data by character offset. Follow next_offset until null. The last four retained outputs for this logical client are kept in memory, up to 2 MB each; shell output and VM-download base64 can both use this resource.",
     inputSchema: {
       workspace_id: z.string().optional(), output_resource_id: z.string(),
       stream: z.enum(["stdout", "stderr"]).optional(),
@@ -1377,7 +1390,7 @@ export function createCodexProServer(
     {
       title: "Disposable VM",
       description:
-        "Use human-approved VM images as disposable isolated test environments. Actions: images, create, status, destroy. This tool cannot import images, expose host paths, run arbitrary QMP, or execute guest commands.",
+        "Use human-approved VM images as disposable isolated test environments. Actions: images, create, status, destroy. Guest execution and file transfer are exposed separately through vm_exec, vm_upload, vm_download, and vm_guest_status.",
       inputSchema: {
         action: z.enum(["images", "create", "status", "destroy"]),
         image: z.string().max(80).optional(),
@@ -1402,6 +1415,163 @@ export function createCodexProServer(
           memoryMb: args.memory_mb
         }, vmManager);
         return textResult(`# VM ${args.action}\n\n${JSON.stringify(result, null, 2)}`, result);
+      } catch (error) {
+        throw new CodexProError(error instanceof Error ? error.message : String(error));
+      }
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "vm_guest_status",
+    {
+      title: "VM Guest Status",
+      description: "Check whether normalized guest control is currently available for a CodexPro-managed VM. Hyper-V PowerShell Direct requires operation-scoped guest credentials; QEMU uses the managed guest-agent channel.",
+      inputSchema: {
+        id: z.string().max(40),
+        credential: VM_GUEST_CREDENTIAL_SCHEMA.optional()
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Checking VM guest control...",
+        "openai/toolInvocation/invoked": "VM guest control status ready"
+      }
+    },
+    async (args) => {
+      try {
+        const result = await runVmGuestStatusTool({ id: args.id, credential: args.credential }, vmManager);
+        return textResult(`# VM guest status\n\n${JSON.stringify(result, null, 2)}`, result);
+      } catch (error) {
+        throw new CodexProError(error instanceof Error ? error.message : String(error));
+      }
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "vm_exec",
+    {
+      title: "VM Execute",
+      description: "Execute a bounded command inside a running CodexPro-managed guest. Supply exactly one of argv or command; command requires an explicit shell. Hyper-V uses PowerShell Direct and requires operation-scoped guest credentials. QEMU uses QEMU Guest Agent.",
+      inputSchema: {
+        id: z.string().max(40),
+        argv: z.array(z.string().min(1).max(16384)).min(1).max(256).optional(),
+        command: z.string().min(1).max(65536).optional(),
+        shell: z.enum(["powershell", "cmd", "sh", "bash"]).optional(),
+        cwd: z.string().min(1).max(4096).optional(),
+        env: z.record(z.string(), z.string().max(16384)).optional(),
+        timeout_ms: z.number().int().min(100).max(VM_GUEST_MAX_TIMEOUT_MS).optional(),
+        credential: VM_GUEST_CREDENTIAL_SCHEMA.optional()
+      },
+      annotations: BASH_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Executing in VM guest...",
+        "openai/toolInvocation/invoked": "VM guest command finished"
+      }
+    },
+    async (args) => {
+      try {
+        const result = await runVmExecTool({
+          id: args.id,
+          argv: args.argv,
+          command: args.command,
+          shell: args.shell,
+          cwd: args.cwd,
+          env: args.env,
+          timeoutMs: args.timeout_ms,
+          credential: args.credential
+        }, vmManager);
+        return textResult(`# VM exec\n\n${JSON.stringify(result, null, 2)}`, result);
+      } catch (error) {
+        throw new CodexProError(error instanceof Error ? error.message : String(error));
+      }
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "vm_upload",
+    {
+      title: "VM Upload",
+      description: "Copy bounded base64 file data into a running CodexPro-managed guest. This tool never accepts an arbitrary host source path.",
+      inputSchema: {
+        id: z.string().max(40),
+        guest_path: z.string().min(1).max(4096),
+        data_base64: z.string().max(Math.ceil(VM_GUEST_FILE_MAX_BYTES / 3) * 4),
+        credential: VM_GUEST_CREDENTIAL_SCHEMA.optional()
+      },
+      annotations: LOCAL_WRITE_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Uploading file to VM guest...",
+        "openai/toolInvocation/invoked": "VM guest upload complete"
+      }
+    },
+    async (args) => {
+      try {
+        const result = await runVmUploadTool({
+          id: args.id,
+          guestPath: args.guest_path,
+          dataBase64: args.data_base64,
+          credential: args.credential
+        }, vmManager);
+        return textResult(`# VM upload\n\n${JSON.stringify(result, null, 2)}`, result);
+      } catch (error) {
+        throw new CodexProError(error instanceof Error ? error.message : String(error));
+      }
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "vm_download",
+    {
+      title: "VM Download",
+      description: "Copy one bounded file from a running CodexPro-managed guest. The canonical base64 payload is retained in memory and returned through read_output using the provided output_resource_id; no arbitrary host destination path is accepted.",
+      inputSchema: {
+        id: z.string().max(40),
+        guest_path: z.string().min(1).max(4096),
+        credential: VM_GUEST_CREDENTIAL_SCHEMA.optional()
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Downloading file from VM guest...",
+        "openai/toolInvocation/invoked": "VM guest download complete"
+      }
+    },
+    async (args) => {
+      try {
+        const result = await runVmDownloadTool({
+          id: args.id,
+          guestPath: args.guest_path,
+          credential: args.credential
+        }, vmManager);
+        if (typeof result.dataBase64 !== "string") throw new Error("VM download returned invalid base64 payload data.");
+        const workspace = workspaces.getWorkspace();
+        if (Buffer.byteLength(result.dataBase64, "utf8") > outputs.captureBytes) {
+          throw new Error("VM download payload exceeds the retained output capacity.");
+        }
+        const outputResourceId = outputs.save(workspace.id, result.dataBase64, "", false);
+        const { dataBase64: _dataBase64, ...publicResult } = result;
+        const retained = {
+          ...publicResult,
+          workspace_id: workspace.id,
+          output_resource_id: outputResourceId,
+          stream: "stdout",
+          encoding: "base64",
+          total_chars: result.dataBase64.length
+        };
+        return textResult(
+          `# VM download\n\nDownloaded ${String(result.bytes)} bytes from the managed guest. Base64 payload retained as ${outputResourceId}; use read_output with workspace_id=${workspace.id}, stream=stdout, and successive next_offset values until null.`,
+          retained
+        );
       } catch (error) {
         throw new CodexProError(error instanceof Error ? error.message : String(error));
       }

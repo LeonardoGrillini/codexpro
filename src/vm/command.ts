@@ -6,7 +6,7 @@ export interface CommandResult {
 }
 
 export interface CommandExecutor {
-  run(command: string, args: readonly string[], options?: { timeoutMs?: number; cwd?: string }): Promise<CommandResult>;
+  run(command: string, args: readonly string[], options?: { timeoutMs?: number; cwd?: string; env?: NodeJS.ProcessEnv }): Promise<CommandResult>;
 }
 
 export const nodeCommandExecutor: CommandExecutor = {
@@ -17,6 +17,7 @@ export const nodeCommandExecutor: CommandExecutor = {
         [...args],
         {
           cwd: options.cwd,
+          env: options.env,
           timeout: options.timeoutMs ?? 10_000,
           windowsHide: true,
           encoding: "utf8",

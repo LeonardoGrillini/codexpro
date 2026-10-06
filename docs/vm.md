@@ -1,6 +1,6 @@
 # VM runtimes
 
-CodexPro creates disposable guest operating systems for isolated software testing. Backend selection is automatic: **Windows: Hyper-V; Linux: QEMU/KVM; macOS: QEMU/HVF**. `VmManager` delegates lifecycle operations to separate backends; QMP, QGA, QEMU processes and qcow2 conversion stay in the QEMU implementation. Hyper-V uses bounded calls to the standard PowerShell module with structured JSON data. Neither backend exposes guest execution yet.
+CodexPro creates disposable guest operating systems for isolated software testing. Backend selection is automatic: **Windows: Hyper-V; Linux: QEMU/KVM; macOS: QEMU/HVF**. `VmManager` delegates lifecycle and normalized guest-control operations to separate backends; QMP, QGA, QEMU processes and qcow2 conversion stay in the QEMU implementation. Hyper-V lifecycle uses bounded calls to the standard PowerShell module, while Windows guest control uses PowerShell Direct. Agents use backend-neutral `vm_exec`, `vm_upload`, `vm_download`, and `vm_guest_status` tools rather than choosing a Hyper-V/QEMU transport.
 
 ## Host prerequisites
 
@@ -133,46 +133,61 @@ codexpro vm list
 codexpro vm destroy vm-0123456789abcdef
 ```
 
-## Guest requirements
+## Guest control
 
-QEMU images may contain and start QEMU Guest Agent at boot for readiness detection. Hyper-V does not require QGA. Prepare whatever compilers, runtimes and test tools your workflow needs inside the guest.
+CodexPro exposes four backend-neutral agent tools: `vm_guest_status`, `vm_exec`, `vm_upload`, and `vm_download`. The caller supplies a CodexPro instance ID; the manager resolves the recorded backend and native VM identity. Agents never choose `Invoke-Command`, QGA RPC names, a Hyper-V display name, or an arbitrary host VM.
 
-Common Linux distributions package the agent as `qemu-guest-agent`. Install the distribution package and enable its service before importing the image. Exact package/service names vary by distribution.
+### Hyper-V / Windows guests
 
-A validation boot checks that the selected backend starts the VM and remains running after a short interval; this is not proof the guest OS completed boot. QEMU additionally probes QGA; Hyper-V reports guest-agent availability as false. CodexPro reports these separately:
+Windows guest control uses **PowerShell Direct**. Microsoft documents PowerShell Direct for local Hyper-V hosts and Windows 10 / Windows Server 2016 or later guests; the VM must be running with a user profile configured, the host caller must be a Hyper-V administrator, and valid guest credentials are required. PowerShell Direct works independently of guest network configuration and remote-management/WinRM settings. CodexPro uses `New-PSSession -VMId` with the already verified Hyper-V GUID, not a caller-supplied VM name, and always removes the PSSession. File transfer uses `Copy-Item -ToSession` / `-FromSession`. See [Microsoft: PowerShell Direct](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/powershell-direct) and [Copy-Item](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/copy-item).
 
-```text
-Boot                 ✓
-QEMU Guest Agent     ✗
-AI command execution unavailable
-```
+Guest credentials are **operation-scoped only**. CodexPro does not store them in image manifests, runtime records, VM Notes, Git, tool results, or logs. The host PowerShell child receives the credential through its environment and converts it to a `PSCredential`; the password is not inserted into generated PowerShell source or the encoded structured command payload. The unattended Windows path still creates the local Administrator account with a blank initial password and requires a password change at first sign-in. Automation does not weaken that policy: set a usable password in the guest before PowerShell Direct can authenticate.
 
-A boot-tested image is not automatically CodexPro-compatible. Guest command/file execution is intentionally not exposed in this first implementation, and CodexPro will not claim guest commands ran when the guest-agent channel is unavailable.
+### QEMU guests
+
+QEMU guest control uses the existing private **QEMU Guest Agent (QGA)** channel. Install/start the guest agent in the image (commonly the `qemu-guest-agent` package on Linux) and ensure the required RPCs are enabled. `vm_guest_status` uses `guest-info`; execution maps to `guest-exec` plus bounded `guest-exec-status` polling; stdout/stderr are decoded from QGA's base64 fields. File transfer uses `guest-file-open`, chunked `guest-file-read` / `guest-file-write`, `guest-file-flush`, and `guest-file-close` with handles closed in failure paths. See the official [QEMU Guest Agent](https://www.qemu.org/docs/master/interop/qemu-ga.html) and [QGA protocol reference](https://www.qemu.org/docs/master/interop/qemu-ga-ref.html).
+
+The QGA client sends `guest-sync-delimited` on initial connection and again after a client-side timeout, as required by QEMU to discard stale/partial protocol data. A QGA command timeout is a transport error; a guest process returning exit code 1 (or any other nonzero code) is a normal `vm_exec` result, not an MCP transport failure.
+
+### Execution semantics and limits
+
+`vm_exec` has one canonical internal representation: executable + argv + environment. The agent must provide exactly one of:
+
+- `argv`: a non-empty array executed directly; no host shell concatenation is performed.
+- `command` plus an explicit `shell`: `powershell`, `cmd`, `sh`, or `bash`. `sh` uses `/bin/sh -c`; `bash` uses `/bin/bash -lc`; PowerShell uses noninteractive `powershell.exe -Command`; `cmd` uses `cmd.exe /d /s /c`.
+
+A working directory is supported for shell-command mode through fixed guest-side wrappers. Direct `argv` + `cwd` is rejected because QGA has no portable working-directory field. `cmd` + `cwd` is also rejected; use PowerShell for a Windows working directory. Environment variable names and aggregate environment size are validated.
+
+The default execution timeout is **30 seconds** and the maximum is **300 seconds**. Stdout and stderr are retained separately and capped at **48 KiB each**, with truncation flags. Hyper-V attempts to kill the guest process when its execution deadline expires. QGA has no generic guest-process kill RPC, so a process reported as timed out may continue running in the guest; destroy/reset the disposable VM if that matters for the workflow.
+
+`vm_upload` and `vm_download` are limited to **1 MiB per file** in the current MCP surface. QGA transfers in **48 KiB chunks**. Hyper-V transfer stages data only through a random temporary file inside the CodexPro-owned instance directory and a PowerShell Direct session; MCP callers cannot provide arbitrary host source/destination paths. A download's canonical base64 payload is retained in the existing in-memory output store and `vm_download` returns its `output_resource_id`, `workspace_id`, encoding, and total character count. Use `read_output` on the returned resource, following `next_offset` until null, then concatenate the pages before base64-decoding. These primitives are intended for source snippets, build outputs, logs, dumps, and similar bounded artifacts, not bulk disk transfer.
 
 ## Management channels and desktop metadata
 
-QEMU lifecycle management uses private QMP, with QGA as an optional separate guest channel. Linux/macOS use sockets in the instance directory. Hyper-V uses native PowerShell cmdlets and GUID/Notes ownership checks, without QMP or QGA.
+QEMU lifecycle management uses private QMP and guest control uses a distinct private QGA channel. Linux/macOS use managed local sockets/pipes/endpoints recorded in the instance runtime. Hyper-V lifecycle uses native PowerShell cmdlets, while guest control uses PowerShell Direct after the same GUID/Notes ownership verification.
 
-`--desktop` records that the image provides a graphical desktop. Full desktop automation and human VNC/noVNC viewing are not implemented here. The QMP layer is typed and already provides bounded foundations for later screenshots, input events, reset, shutdown, and guest-state queries. VNC is not the AI control protocol.
+`--desktop` records that the image provides a graphical desktop. Full desktop automation and human VNC/noVNC viewing are not implemented here. Persistent interactive shells/PTYs are also intentionally not implemented: agents should use sequences of bounded `vm_exec` calls.
 
 ## Security boundary
 
-The VM subsystem is separate from CodexPro's host tools. Host Bash and file tools remain a local developer bridge with their existing restrictions; they are not converted into an OS sandbox merely because VM support exists.
+The VM subsystem is separate from CodexPro's host tools. Guest execution is intentionally powerful **inside the selected guest**, but it is not arbitrary host command execution. Host PowerShell bodies are fixed; user commands, argv, environment values, guest paths, IDs, and other values travel as structured data. CodexPro does not use `Invoke-Expression` or interpolate guest command text into host PowerShell.
 
-VM instances improve isolation for software testing, but they do not make arbitrary code universally safe. CodexPro does not automatically mount the host workspace or inject `.env` files, SSH keys, cloud credentials, browser data, or credential stores into guests. QEMU uses user-mode networking, so guests may reach external networks. Hyper-V starts with its NIC disconnected: no Default Switch, external/LAN bridge, host NAT configuration or automatic port exposure. Network-dependent installers require an explicit human network decision in Hyper-V Manager; future instances again default to disconnected.
+Every guest operation first resolves a CodexPro-managed instance. QEMU requires the stored private QGA endpoint and a live managed QEMU process. Hyper-V requires the persisted VM GUID and exact random ownership token in VM Notes before establishing PowerShell Direct; display names do not authorize access. Guest operations share the Hyper-V instance operation lock with lifecycle/destruction, so a destroy cannot race an active guest operation.
 
-Image names and instance IDs are validated, resources and timeouts are bounded, management channels are private, failed starts are cleaned up, and recursive deletion is limited to CodexPro-owned instance directories. Image import remains a human operation; the AI-facing `vm` tool can only list approved images and create, inspect the status of, or destroy disposable instances.
+CodexPro does not automatically mount the host workspace or inject `.env` files, SSH keys, cloud credentials, browser data, or credential stores into guests. QEMU uses user-mode networking, so guests may reach external networks. Hyper-V starts with its NIC disconnected unless a human changes networking. The lifecycle `vm` tool still only lists approved images and creates/statuses/destroys instances; guest operations are the separate normalized tools above.
 
 ## Current limitations
 
 - Hyper-V and QEMU installation/configuration are external to CodexPro.
 - Hardware acceleration is required; Windows has no automatic QEMU or VirtualBox fallback.
 - Cross-architecture hardware-accelerated guests are rejected.
-- Full guest command/file execution is deferred even when QEMU Guest Agent is available.
-- Desktop screenshot/input APIs are foundations only; full desktop automation is deferred.
-- Some aarch64 guest images may require firmware or machine-specific boot configuration that is not automatically provisioned by this first version.
-- PowerShell Direct, host/guest file transfer, Hyper-V screenshots/desktop input and optional VirtualBox fallback remain follow-up work.
+- Hyper-V PowerShell Direct guest control supports compatible Windows guests; Linux guests on Hyper-V are not given a separate SSH/WinRM fallback.
+- QEMU guest control requires QGA and the relevant RPCs to be enabled in the guest.
+- A QGA-timed-out guest process may continue because QGA does not expose a generic process-kill command.
+- File transfer is intentionally bounded to 1 MiB per call/file; bulk transfer and streaming resources are not implemented.
+- Persistent interactive PTY/shell sessions and GUI automation remain deferred.
+- Some aarch64 guest images may require firmware or machine-specific boot configuration that is not automatically provisioned.
 
 ## Verification
 
-`npm run vm:hyperv:smoke` runs platform/schema/argument tests and mocked PowerShell lifecycle, ownership and failure-recovery tests without requiring Hyper-V. On Windows it also parses generated scripts with the native PowerShell parser without executing them. `npm run vm:hyperv:integration` checks readiness, then uses a newly created blank disposable disk/VM only, verifies that vTPM and a key protector are present, or reports a skip. It never uses an existing image or arbitrary existing VM. Booting a blank disk validates lifecycle, not guest OS installation; a real interactive ISO install still needs human validation. `npm test` includes the existing QEMU reliability and new Hyper-V smoke tests.
+`npm run vm:guest:smoke` runs normalized API validation plus a mocked QGA server covering synchronization/recovery, `guest-exec` polling, nonzero exits, timeouts, output truncation, agent-unavailable errors, file chunking, handle cleanup, backend/state guards, and secret-key redaction. `npm run vm:hyperv:smoke` covers PowerShell Direct fixed-script structure, VM GUID/Notes ownership, transient credentials, nonzero exits, timeouts, file transfer and cleanup in addition to lifecycle tests; on Windows it parses generated scripts with the native Windows PowerShell parser without executing them. `npm run vm:hyperv:integration` remains the opt-in native Hyper-V lifecycle test. `npm test` runs both guest-control smoke paths with the complete project smoke suite.

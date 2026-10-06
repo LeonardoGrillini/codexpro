@@ -8,7 +8,9 @@ import { HypervBackend } from "./backends/hyperv/hypervBackend.js";
 import type { VmBackend } from "./backends/backend.js";
 import type { VmArchitecture, VmBackendKind } from "./types.js";
 import type { VmManagerOptions, SetupVmImageOptions, CreateVmOptions } from "./api.js";
+import type { VmExecOptions, VmGuestCredential } from "./guestControl.js";
 export * from "./api.js";
+export * from "./guestControl.js";
 export { allocateLoopbackPort } from "./backends/qemu/qemuBackend.js";
 
 export function backendForPlatform(platform: NodeJS.Platform = process.platform): VmBackendKind {
@@ -48,6 +50,10 @@ export class VmManager {
   listInstances() { return this.runtime.listInstances(); }
   destroyInstance(id: string) { return this.runtime.destroyInstance(id); }
   validateImage(name: string) { return this.runtime.validateImage(name); }
+  guestStatus(id: string, credential?: VmGuestCredential) { return this.runtime.guestStatus(id, credential); }
+  exec(id: string, options: VmExecOptions) { return this.runtime.exec(id, options); }
+  upload(id: string, guestPath: string, data: Buffer, credential?: VmGuestCredential) { return this.runtime.upload(id, guestPath, data, credential); }
+  download(id: string, guestPath: string, credential?: VmGuestCredential) { return this.runtime.download(id, guestPath, credential); }
   listImages() { return this.images.listImages(); }
   inspectImage(name: string) { return this.images.readManifest(name, true); }
   vmHome() { return this.root; }

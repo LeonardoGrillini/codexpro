@@ -1,7 +1,8 @@
 import type { CreateVmOptions, SetupVmImageOptions, VmDoctorReport } from "../api.js";
 import type { VmArchitecture, VmImageManifest, VmInstanceRecord } from "../types.js";
+import type { VmExecOptions, VmExecResult, VmGuestCredential, VmGuestStatus } from "../guestControl.js";
 
-/** Lifecycle boundary. Guest execution/transfer are not capabilities of either backend yet. */
+/** Backend boundary for lifecycle plus normalized guest control. */
 export interface VmBackend {
   doctor(architecture?: VmArchitecture): Promise<VmDoctorReport>;
   setupImage(options: SetupVmImageOptions): Promise<VmImageManifest>;
@@ -10,6 +11,10 @@ export interface VmBackend {
   listInstances(): Promise<VmInstanceRecord[]>;
   destroyInstance(id: string): Promise<void>;
   validateImage(name: string): Promise<VmImageManifest>;
+  guestStatus(id: string, credential?: VmGuestCredential): Promise<VmGuestStatus>;
+  exec(id: string, options: VmExecOptions): Promise<VmExecResult>;
+  upload(id: string, guestPath: string, data: Buffer, credential?: VmGuestCredential): Promise<{ bytes: number }>;
+  download(id: string, guestPath: string, credential?: VmGuestCredential): Promise<Buffer>;
 }
 
 export interface DiskImporter {

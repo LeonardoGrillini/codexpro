@@ -43,6 +43,16 @@ assert.match(hypervScripts.destroy, /ownership could not be verified/);
 assert.ok(hypervScripts.destroy.indexOf('ownership could not be verified') < hypervScripts.destroy.indexOf('Stop-VM'));
 assert.ok(hypervScripts.destroy.indexOf('Stop-VM') < hypervScripts.destroy.indexOf('Remove-VM'));
 assert.doesNotMatch(hypervScripts.destroy, /-Name|Merge-VHD|Remove-Item/);
+for (const operation of ['guestStatus', 'guestExec', 'guestUpload', 'guestDownload']) {
+  assert.match(hypervScripts[operation], /New-PSSession -VMId \$vm\.Id -Credential \$credential/);
+  assert.match(hypervScripts[operation], /Remove-PSSession -Session \$s/);
+  assert.doesNotMatch(hypervScripts[operation], /-VMName|Invoke-Expression/);
+  assert.ok(hypervScripts[operation].indexOf('ownership could not be verified') < hypervScripts[operation].indexOf('New-PSSession'));
+}
+assert.match(hypervScripts.guestUpload, /Copy-Item .* -ToSession \$s/);
+assert.match(hypervScripts.guestDownload, /Copy-Item -FromSession \$s/);
+assert.match(hypervScripts.guestExec, /Diagnostics\.ProcessStartInfo/);
+assert.match(hypervScripts.guestExec, /WaitForExit/);
 
 const unattendedXml = createWindowsUnattendXml({ username: 'devuser' });
 assert.match(unattendedXml, /<WillWipeDisk>true<\/WillWipeDisk>/);
@@ -68,6 +78,7 @@ let failTpm = false;
 let lostCreateResponse = false;
 let failDestroy = false;
 let stopInstaller = false;
+const guestCredential = { username: 'devuser', password: ['test', 'credential'].join('-') };
 const executor = {
   async run(binary, args, options) {
     assert.match(binary, /powershell\.exe$/i);
@@ -77,6 +88,13 @@ const executor = {
     const payload = JSON.parse(Buffer.from(script.match(/FromBase64String\('([^']+)'\)/)[1], 'base64').toString('utf8'));
     const operation = Object.keys(hypervScripts).find(key => script.includes(hypervScripts[key]));
     assert.ok(operation, script);
+    if (operation.startsWith('guest')) {
+      assert.ok(options.env?.CODEXPRO_HYPERV_GUEST_CREDENTIAL, 'guest credentials must travel only in the child environment');
+      const decodedCredential = JSON.parse(Buffer.from(options.env.CODEXPRO_HYPERV_GUEST_CREDENTIAL, 'base64').toString('utf8'));
+      assert.deepEqual(decodedCredential, guestCredential);
+      assert.ok(!script.includes(guestCredential.password));
+      assert.ok(!JSON.stringify(payload).includes(guestCredential.password));
+    }
     calls.push({ operation, payload, script });
     const result = value => ({ stdout: JSON.stringify(value), stderr: '', exitCode: 0 });
     const error = message => ({ stdout: '', stderr: message, exitCode: 1 });
@@ -95,7 +113,7 @@ const executor = {
         assert.equal(answer.subarray(16 * 2048 + 1, 16 * 2048 + 6).toString('ascii'), 'CD001');
         assert.ok(answer.includes(Buffer.from('AUTOUNATTEND.XML;1', 'ascii')));
       }
-      vms.set(vmId, { ownershipId: payload.ownershipId, state: 'Off', iso: payload.iso });
+      vms.set(vmId, { ownershipId: payload.ownershipId, state: 'Off', iso: payload.iso, guestFiles: new Map() });
       await fs.writeFile(payload.journal, '\uFEFF' + JSON.stringify({ vmId, ownershipId: payload.ownershipId }));
       if (failTpm) return error('Virtual TPM could not be enabled.');
       if (lostCreateResponse) return error('Lost creation response');
@@ -104,6 +122,34 @@ const executor = {
     const vm = vms.get(payload.vmId);
     if (operation === 'destroy' && !vm) return result({ removed: true });
     if (!vm || vm.ownershipId !== payload.ownershipId) return error('Hyper-V ownership could not be verified; refusing operation.');
+    if (operation === 'guestStatus') return result({ available: true });
+    if (operation === 'guestExec') {
+      const marker = payload.spec.args?.find(value => String(value).includes('UNTRUSTED_MARKER'));
+      if (marker) assert.ok(!script.includes(marker), 'guest argv must remain encoded data, never host PowerShell source');
+      if (payload.spec.executable === 'timeout.exe') {
+        return result({ exitCode: null, timedOut: true, stdoutB64: '', stderrB64: '', stdoutTruncated: false, stderrTruncated: false });
+      }
+      return result({
+        exitCode: 7,
+        timedOut: false,
+        stdoutB64: Buffer.from('guest stdout\n').toString('base64'),
+        stderrB64: Buffer.from('guest stderr\n').toString('base64'),
+        stdoutTruncated: false,
+        stderrTruncated: false
+      });
+    }
+    if (operation === 'guestUpload') {
+      const data = await fs.readFile(payload.hostPath);
+      vm.guestFiles.set(payload.guestPath, data);
+      return result({ bytes: data.length });
+    }
+    if (operation === 'guestDownload') {
+      const data = vm.guestFiles.get(payload.guestPath);
+      if (!data) return error('Guest file not found.');
+      if (data.length > payload.maxBytes) return error('Guest file exceeds the transfer size limit.');
+      await fs.writeFile(payload.hostPath, data);
+      return result({ bytes: data.length });
+    }
     if (operation === 'start') {
       if (failStart) return error('Simulated failed start');
       vm.state = 'Running'; return result({ state: 'Running' });
@@ -178,8 +224,41 @@ try {
   const diff = calls.find(c => c.operation === 'disk' && c.payload.parent);
   assert.equal(diff.payload.parent, manager.images.basePath('native', 'vhdx'));
   assert.equal(diff.payload.disk, path.join(instance.instanceDir, 'overlay.vhdx'));
+  assert.deepEqual(await manager.guestStatus(instance.id), {
+    id: instance.id,
+    backend: 'hyperv',
+    state: 'running',
+    transport: 'powershell-direct',
+    available: false,
+    canExec: false,
+    reason: 'Guest credentials are required for PowerShell Direct.'
+  });
+  assert.equal((await manager.guestStatus(instance.id, guestCredential)).canExec, true);
+  await assert.rejects(manager.exec(instance.id, { argv: ['cmd.exe', '/c', 'echo'] }), /credentials are required/);
+  const guestExec = await manager.exec(instance.id, {
+    argv: ['tool.exe', 'UNTRUSTED_MARKER-$(host-code-must-not-run)'],
+    env: { SAFE_VALUE: 'yes' },
+    timeoutMs: 1000,
+    credential: guestCredential
+  });
+  assert.equal(guestExec.exitCode, 7);
+  assert.equal(guestExec.stdout, 'guest stdout\n');
+  assert.equal(guestExec.stderr, 'guest stderr\n');
+  assert.equal(guestExec.transport, 'powershell-direct');
+  const guestTimeout = await manager.exec(instance.id, { argv: ['timeout.exe'], timeoutMs: 100, credential: guestCredential });
+  assert.equal(guestTimeout.timedOut, true);
+  assert.equal(guestTimeout.exitCode, null);
+  const guestFile = Buffer.from('guest transfer bytes');
+  assert.equal((await manager.upload(instance.id, 'C:\\Temp\\codexpro.bin', guestFile, guestCredential)).bytes, guestFile.length);
+  assert.deepEqual(await manager.download(instance.id, 'C:\\Temp\\codexpro.bin', guestCredential), guestFile);
+  assert.ok(!(await fs.readdir(instance.instanceDir)).some(name => name.startsWith('.guest-upload-') || name.startsWith('.guest-download-')));
+
   const vm = vms.get(instance.hyperv.vmId);
   vm.ownershipId = 'b'.repeat(64);
+  await assert.rejects(
+    manager.exec(instance.id, { argv: ['tool.exe'], credential: guestCredential }),
+    /ownership/
+  );
   await assert.rejects(manager.destroyInstance(instance.id), /ownership/);
   assert.ok(vms.has(instance.hyperv.vmId)); assert.ok((await fs.stat(instance.instanceDir)).isDirectory());
   vm.ownershipId = instance.hyperv.ownershipId;

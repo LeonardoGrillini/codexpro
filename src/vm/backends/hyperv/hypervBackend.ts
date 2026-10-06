@@ -11,6 +11,7 @@ import { codexProHome } from "../../../profileStore.js";
 import type { VmBackend, DiskImporter } from "../backend.js";
 import { HypervPowerShell } from "./powershell.js";
 import { validateWindowsUsername, writeWindowsUnattendIso, type WindowsIsoInspection } from "./windowsUnattend.js";
+import { normalizeVmExec, validateGuestCredential, validateGuestFileData, VM_GUEST_FILE_MAX_BYTES, VM_GUEST_OUTPUT_MAX_BYTES, type VmExecOptions, type VmExecResult, type VmGuestCredential, type VmGuestStatus } from "../../guestControl.js";
 
 export function hypervState(state: string): VmInstanceState {
   if (state === "Running") return "running";
@@ -277,6 +278,108 @@ export class HypervBackend implements VmBackend {
     const record = await this.instances.read(id);
     await this.lock(record, () => this.stopVm(record));
     await this.instances.remove(id);
+  }
+
+  async guestStatus(id: string, credential?: VmGuestCredential): Promise<VmGuestStatus> {
+    const record = await this.status(id);
+    if (record.backend !== "hyperv") throw new Error("This instance requires the QEMU backend.");
+    const base = { id: record.id, backend: "hyperv" as const, state: record.state, transport: "powershell-direct" as const };
+    if (record.state !== "running") return { ...base, available: false, canExec: false, reason: "VM is not running." };
+    const checked = validateGuestCredential(credential);
+    if (!checked) return { ...base, available: false, canExec: false, reason: "Guest credentials are required for PowerShell Direct." };
+    try {
+      return await this.lock(record, async () => {
+        await this.ps.run("guestStatus", await this.identity(await this.instances.read(id)), 10_000, checked);
+        return { ...base, available: true, canExec: true };
+      });
+    } catch (error) {
+      return { ...base, available: false, canExec: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  async exec(id: string, options: VmExecOptions): Promise<VmExecResult> {
+    const record = await this.status(id);
+    if (record.backend !== "hyperv") throw new Error("This instance requires the QEMU backend.");
+    if (record.state !== "running") throw new Error(`VM instance "${id}" is not running.`);
+    const plan = normalizeVmExec(options);
+    if (!plan.credential) throw new Error("Guest credentials are required for PowerShell Direct.");
+    return this.lock(record, async () => {
+      const identity = await this.identity(await this.instances.read(id));
+      const result = await this.ps.run<{
+        exitCode: number | null;
+        timedOut: boolean;
+        stdoutB64: string;
+        stderrB64: string;
+        stdoutTruncated: boolean;
+        stderrTruncated: boolean;
+      }>("guestExec", {
+        ...identity,
+        spec: {
+          executable: plan.executable,
+          args: plan.args,
+          env: plan.env,
+          timeoutMs: plan.timeoutMs,
+          maxOutputBytes: VM_GUEST_OUTPUT_MAX_BYTES
+        }
+      }, Math.min(330_000, plan.timeoutMs + 15_000), plan.credential);
+      return {
+        exitCode: result.exitCode,
+        stdout: Buffer.from(result.stdoutB64 ?? "", "base64").toString("utf8"),
+        stderr: Buffer.from(result.stderrB64 ?? "", "base64").toString("utf8"),
+        timedOut: result.timedOut === true,
+        stdoutTruncated: result.stdoutTruncated === true,
+        stderrTruncated: result.stderrTruncated === true,
+        transport: "powershell-direct"
+      };
+    });
+  }
+
+  async upload(id: string, guestPath: string, data: Buffer, credential?: VmGuestCredential): Promise<{ bytes: number }> {
+    const checked = validateGuestCredential(credential);
+    if (!checked) throw new Error("Guest credentials are required for PowerShell Direct.");
+    validateGuestFileData(data);
+    if (!guestPath || guestPath.length > 4096 || guestPath.includes("\0")) throw new Error("Invalid guest destination path.");
+    const record = await this.status(id);
+    if (record.backend !== "hyperv") throw new Error("This instance requires the QEMU backend.");
+    if (record.state !== "running") throw new Error(`VM instance "${id}" is not running.`);
+    return this.lock(record, async () => {
+      const hostPath = path.join(record.instanceDir, `.guest-upload-${randomBytes(12).toString("hex")}`);
+      try {
+        await fsp.writeFile(hostPath, data, { flag: "wx", mode: 0o600 });
+        const result = await this.ps.run<{ bytes: number }>("guestUpload", { ...(await this.identity(record)), hostPath, guestPath }, 60_000, checked);
+        if (result.bytes !== data.length) throw new Error("PowerShell Direct reported an unexpected upload byte count.");
+        return { bytes: result.bytes };
+      } finally {
+        await fsp.rm(hostPath, { force: true }).catch(() => {});
+      }
+    });
+  }
+
+  async download(id: string, guestPath: string, credential?: VmGuestCredential): Promise<Buffer> {
+    const checked = validateGuestCredential(credential);
+    if (!checked) throw new Error("Guest credentials are required for PowerShell Direct.");
+    if (!guestPath || guestPath.length > 4096 || guestPath.includes("\0")) throw new Error("Invalid guest source path.");
+    const record = await this.status(id);
+    if (record.backend !== "hyperv") throw new Error("This instance requires the QEMU backend.");
+    if (record.state !== "running") throw new Error(`VM instance "${id}" is not running.`);
+    return this.lock(record, async () => {
+      const hostPath = path.join(record.instanceDir, `.guest-download-${randomBytes(12).toString("hex")}`);
+      try {
+        const result = await this.ps.run<{ bytes: number }>("guestDownload", {
+          ...(await this.identity(record)),
+          hostPath,
+          guestPath,
+          maxBytes: VM_GUEST_FILE_MAX_BYTES
+        }, 60_000, checked);
+        const stat = await fsp.lstat(hostPath);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== result.bytes || stat.size > VM_GUEST_FILE_MAX_BYTES) {
+          throw new Error("PowerShell Direct returned an invalid downloaded file.");
+        }
+        return await fsp.readFile(hostPath);
+      } finally {
+        await fsp.rm(hostPath, { force: true }).catch(() => {});
+      }
+    });
   }
 
   async validateImage(name: string): Promise<VmImageManifest> {

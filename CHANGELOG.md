@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-- Added an optional QEMU-only disposable VM runtime with interactive/headless image setup, immutable managed qcow2 bases, per-instance overlays, WHPX/KVM/HVF probing, typed QMP/QEMU Guest Agent channels, lifecycle CLI commands, and a bounded AI-facing `vm` tool for approved-image list/create/status/destroy actions.
+- Added optional platform-native disposable VM runtimes: Windows Hyper-V with VHDX differencing disks, Linux QEMU/KVM, and macOS QEMU/HVF, with interactive/headless image setup where supported, immutable managed bases, per-instance overlays, typed QEMU management channels, lifecycle CLI commands, and a bounded AI-facing `vm` tool for approved-image list/create/status/destroy actions.
 - Kept VM image import human-owned, QEMU externally installed, host tools under their existing safety model, and documented that VM isolation improves the testing boundary without making arbitrary code universally safe.
+- Added backend-neutral `vm_guest_status`, `vm_exec`, `vm_upload`, and `vm_download` tools: Hyper-V Windows guests use ownership-verified PowerShell Direct with operation-scoped credentials, while QEMU guests use QGA `guest-exec` and guest-file RPCs with wire resynchronization, bounded output/file sizes, cleanup, and paged retained download payloads.
 
 ## 0.30.0 (2026-08-08)
 

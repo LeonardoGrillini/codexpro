@@ -182,6 +182,7 @@ Tool results are bounded before reaching ChatGPT's subcall inspector, whether to
 - Attachment import only accepts ChatGPT Apps SDK file objects from approved HTTPS hosts
 - Host file/bash tools remain a local developer bridge, not an OS sandbox.
 - Optional VM runtimes (Windows Hyper-V, Linux QEMU/KVM, macOS QEMU/HVF) provide separate disposable guest environments with immutable bases and per-instance overlays.
+- Backend-neutral guest tools provide bounded exec/upload/download/status operations through ownership-verified PowerShell Direct on Hyper-V or QEMU Guest Agent on QEMU; agents do not select raw backend commands.
 - VM isolation improves the testing boundary but does not make arbitrary code universally safe.
 
 Read [SECURITY.md](SECURITY.md) before exposing a tunnel.

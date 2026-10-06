@@ -1,10 +1,18 @@
 import path from "node:path";
 import { nodeCommandExecutor, type CommandExecutor } from "../../command.js";
+import type { VmGuestCredential } from "../../guestControl.js";
 
 // Only these scripts execute. Values enter as base64-encoded JSON, never as PowerShell syntax.
 const ownedVm = `
 $vm = Get-VM -Id ([Guid]$p.vmId) -ErrorAction Stop
 if ($vm.Notes -cne ('CodexPro:' + $p.ownershipId)) { throw 'Hyper-V ownership could not be verified; refusing operation.' }
+`;
+
+const guestCredential = `
+if ([string]::IsNullOrEmpty($env:CODEXPRO_HYPERV_GUEST_CREDENTIAL)) { throw 'Guest credentials are required for PowerShell Direct.' }
+$secretData = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:CODEXPRO_HYPERV_GUEST_CREDENTIAL)) | ConvertFrom-Json
+$secure = ConvertTo-SecureString ([string]$secretData.password) -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential ([string]$secretData.username), $secure
 `;
 
 export const hypervScripts = {
@@ -98,6 +106,122 @@ if ((Get-VM -Id $vm.Id).State -ne 'Off') { throw 'VM has not stopped; preserving
 Remove-VM -VM $vm -Force -Confirm:$false
 @{ removed=$true } | ConvertTo-Json -Compress
 `,
+  guestStatus: ownedVm + guestCredential + `
+if ($vm.State -ne 'Running') { throw 'VM is not running.' }
+$s = $null
+try {
+  $s = New-PSSession -VMId $vm.Id -Credential $credential -ErrorAction Stop
+  @{ available=$true } | ConvertTo-Json -Compress
+} finally {
+  if ($null -ne $s) { Remove-PSSession -Session $s -ErrorAction SilentlyContinue }
+}
+`,
+  guestExec: ownedVm + guestCredential + `
+if ($vm.State -ne 'Running') { throw 'VM is not running.' }
+$s = $null
+try {
+  $s = New-PSSession -VMId $vm.Id -Credential $credential -ErrorAction Stop
+  $result = Invoke-Command -Session $s -ScriptBlock {
+    param($spec)
+    function Quote-CodexProArg([string]$value) {
+      if ($value.Length -gt 0 -and $value -notmatch '[\\s"]') { return $value }
+      $builder = New-Object Text.StringBuilder
+      [void]$builder.Append('"')
+      $slashes = 0
+      foreach ($ch in $value.ToCharArray()) {
+        if ($ch -eq '\\') { $slashes++; continue }
+        if ($ch -eq '"') {
+          if ($slashes -gt 0) { [void]$builder.Append(('\\' * ($slashes * 2))) }
+          [void]$builder.Append('\\')
+          [void]$builder.Append('"')
+          $slashes = 0
+          continue
+        }
+        if ($slashes -gt 0) { [void]$builder.Append(('\\' * $slashes)); $slashes = 0 }
+        [void]$builder.Append($ch)
+      }
+      if ($slashes -gt 0) { [void]$builder.Append(('\\' * ($slashes * 2))) }
+      [void]$builder.Append('"')
+      return $builder.ToString()
+    }
+    function Read-CodexProPrefix([string]$filename, [int]$limit) {
+      $stream = [IO.File]::Open($filename, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+      try {
+        $count = [int][Math]::Min([long]$limit, $stream.Length)
+        $bytes = New-Object byte[] $count
+        $read = $stream.Read($bytes, 0, $count)
+        if ($read -le 0) { $bytes = [byte[]]::new(0) }
+        elseif ($read -lt $count) { $bytes = $bytes[0..($read - 1)] }
+        return @{ data=[Convert]::ToBase64String($bytes); truncated=($stream.Length -gt $limit) }
+      } finally { $stream.Dispose() }
+    }
+
+    $outPath = [IO.Path]::GetTempFileName()
+    $errPath = [IO.Path]::GetTempFileName()
+    $outFile = $null; $errFile = $null; $process = $null
+    try {
+      $psi = New-Object Diagnostics.ProcessStartInfo
+      $psi.FileName = [string]$spec.executable
+      $psi.UseShellExecute = $false
+      $psi.CreateNoWindow = $true
+      $psi.RedirectStandardOutput = $true
+      $psi.RedirectStandardError = $true
+      $psi.Arguments = [string]::Join(' ', @($spec.args | ForEach-Object { Quote-CodexProArg ([string]$_) }))
+      foreach ($entry in $spec.env.PSObject.Properties) { $psi.EnvironmentVariables[$entry.Name] = [string]$entry.Value }
+      $process = New-Object Diagnostics.Process
+      $process.StartInfo = $psi
+      if (!$process.Start()) { throw 'Guest process did not start.' }
+      $outFile = [IO.File]::Open($outPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+      $errFile = [IO.File]::Open($errPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+      $outTask = $process.StandardOutput.BaseStream.CopyToAsync($outFile)
+      $errTask = $process.StandardError.BaseStream.CopyToAsync($errFile)
+      $timedOut = !$process.WaitForExit([int]$spec.timeoutMs)
+      if ($timedOut) {
+        try { $process.Kill() } catch {}
+        [void]$process.WaitForExit(2000)
+      }
+      [void]$outTask.Wait(5000); [void]$errTask.Wait(5000)
+      $outFile.Dispose(); $outFile = $null
+      $errFile.Dispose(); $errFile = $null
+      $stdout = Read-CodexProPrefix $outPath ([int]$spec.maxOutputBytes)
+      $stderr = Read-CodexProPrefix $errPath ([int]$spec.maxOutputBytes)
+      @{ exitCode=$(if ($timedOut) { $null } else { $process.ExitCode }); timedOut=$timedOut; stdoutB64=$stdout.data; stderrB64=$stderr.data; stdoutTruncated=$stdout.truncated; stderrTruncated=$stderr.truncated }
+    } finally {
+      if ($null -ne $outFile) { $outFile.Dispose() }
+      if ($null -ne $errFile) { $errFile.Dispose() }
+      if ($null -ne $process) { $process.Dispose() }
+      Remove-Item -LiteralPath $outPath,$errPath -Force -ErrorAction SilentlyContinue
+    }
+  } -ArgumentList $p.spec
+  $result | ConvertTo-Json -Compress
+} finally {
+  if ($null -ne $s) { Remove-PSSession -Session $s -ErrorAction SilentlyContinue }
+}
+`,
+  guestUpload: ownedVm + guestCredential + `
+if ($vm.State -ne 'Running') { throw 'VM is not running.' }
+$s = $null
+try {
+  $s = New-PSSession -VMId $vm.Id -Credential $credential -ErrorAction Stop
+  Copy-Item -LiteralPath $p.hostPath -Destination $p.guestPath -ToSession $s -Force -ErrorAction Stop
+  @{ bytes=[long](Get-Item -LiteralPath $p.hostPath).Length } | ConvertTo-Json -Compress
+} finally {
+  if ($null -ne $s) { Remove-PSSession -Session $s -ErrorAction SilentlyContinue }
+}
+`,
+  guestDownload: ownedVm + guestCredential + `
+if ($vm.State -ne 'Running') { throw 'VM is not running.' }
+$s = $null
+try {
+  $s = New-PSSession -VMId $vm.Id -Credential $credential -ErrorAction Stop
+  $length = Invoke-Command -Session $s -ScriptBlock { param($guestPath) [long](Get-Item -LiteralPath $guestPath -ErrorAction Stop).Length } -ArgumentList $p.guestPath
+  if ([long]$length -gt [long]$p.maxBytes) { throw 'Guest file exceeds the transfer size limit.' }
+  Copy-Item -FromSession $s -LiteralPath $p.guestPath -Destination $p.hostPath -Force -ErrorAction Stop
+  @{ bytes=[long](Get-Item -LiteralPath $p.hostPath).Length } | ConvertTo-Json -Compress
+} finally {
+  if ($null -ne $s) { Remove-PSSession -Session $s -ErrorAction SilentlyContinue }
+}
+`,
   console: ownedVm + `
 Start-Process -FilePath "$env:SystemRoot\\System32\\vmconnect.exe" -ArgumentList @('localhost', '-G', $vm.Id.ToString()) | Out-Null
 @{ ok=$true } | ConvertTo-Json -Compress
@@ -109,11 +233,12 @@ export type HypervOperation = keyof typeof hypervScripts;
 export class HypervPowerShell {
   constructor(private readonly executor: CommandExecutor = nodeCommandExecutor) {}
 
-  async run<T>(operation: HypervOperation, values: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<T> {
+  async run<T>(operation: HypervOperation, values: Record<string, unknown> = {}, timeoutMs = 30_000, credential?: VmGuestCredential): Promise<T> {
     const payload = Buffer.from(JSON.stringify(values), "utf8").toString("base64");
     const script = `$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\ntry {\n$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | ConvertFrom-Json\n${operation === "doctor" ? "" : "Import-Module Hyper-V\n"}${hypervScripts[operation]}\n} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }`;
     const binary = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const result = await this.executor.run(binary, ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { timeoutMs });
+    const env = credential ? { ...process.env, CODEXPRO_HYPERV_GUEST_CREDENTIAL: Buffer.from(JSON.stringify(credential), "utf8").toString("base64") } : undefined;
+    const result = await this.executor.run(binary, ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { timeoutMs, env });
     if (result.exitCode !== 0) throw new Error(`Hyper-V ${operation} failed: ${(result.stderr || result.stdout || "command failed or timed out").trim().slice(-4000)}`);
     try { return JSON.parse(result.stdout.replace(/^\uFEFF/, "").trim()) as T; }
     catch { throw new Error(`Hyper-V ${operation} returned invalid JSON.`); }
