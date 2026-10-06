@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { CodexProError } from "./guard.js";
 
-// Session-local, bounded retention; no command output is persisted on disk.
+// Logical-client-local, bounded retention; no command output is persisted on disk.
 export class OutputStore {
   readonly captureBytes = 2_000_000;
   private readonly entries = new Map<string, { workspaceId: string; stdout: string; stderr: string; incomplete: boolean }>();
@@ -15,7 +15,7 @@ export class OutputStore {
 
   read(workspaceId: string, id: string, stream: "stdout" | "stderr", offset = 0, maxChars = 8000) {
     const entry = this.entries.get(id);
-    if (!entry || entry.workspaceId !== workspaceId) throw new CodexProError("Output unavailable for this workspace. Outputs expire after four commands or a session reconnect.");
+    if (!entry || entry.workspaceId !== workspaceId) throw new CodexProError("Output unavailable for this workspace. Outputs expire after four commands or logical-client cleanup.");
     if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(maxChars) || maxChars < 2 || maxChars > 8000) throw new CodexProError("Invalid output page bounds.");
     const value = entry[stream];
     let end = Math.min(value.length, offset + maxChars);

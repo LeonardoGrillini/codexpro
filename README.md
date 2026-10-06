@@ -105,6 +105,16 @@ Ask ChatGPT to `open_workspace` on an allowed project. `open_current_workspace` 
 
 For two ChatGPT accounts or hard isolation, run two CodexPro processes on different ports and Server URLs.
 
+## Logical clients, reconnects, and leases
+
+MCP transport sessions are not application identity. A logical caller should use one stable `client_id` across reconnects so workspace selection, output retention, browser ownership, subagents, cancellation, and scheduler state remain attached to that caller instead of to an HTTP/SSE connection.
+
+HTTP clients should send `CodexPro-Client-Id: <stable-id>` (the compatibility query parameter `client_id=<stable-id>` is also accepted). CodexPro returns `CodexPro-Client-Id` and `CodexPro-Lease-Id` response headers. Stdio callers can set `CODEXPRO_CLIENT_ID`. The MCP `Mcp-Session-Id` is used only for protocol routing, diagnostics, and tracing.
+
+Clients that do not yet provide an HTTP client ID receive a deterministic legacy fingerprint derived from MCP client metadata, User-Agent, and remote address. That fallback is migration-only: two callers with identical metadata/network identity can collide, and the fingerprint can change when that metadata or network path changes. Explicit stable IDs are the supported way to distinguish logical callers.
+
+Logical clients hold renewable leases. Activity renews the lease; an MCP/network disconnect does not release it. `shutdown_client` performs explicit cleanup, while lease expiry deterministically cleans owned agents, browser sessions/pages, worktrees, and cancellation state. `CODEXPRO_CLIENT_LEASE_TTL_MS` controls logical-client lease lifetime (default one hour). This is separate from `CODEXPRO_HTTP_SESSION_TTL_MS`, which only bounds stale transport retention.
+
 ## Commands
 
 ```bash

@@ -15,6 +15,8 @@ export type AgentState = "created" | "running" | "waiting" | "completed" | "fail
 
 export interface ManagedAgent {
   id: string;
+  clientId: string;
+  leaseId?: string;
   parentId?: string;
   role: AgentRole;
   backend: string;
@@ -110,7 +112,7 @@ export class AgentManager {
   private readonly agents = new Map<string, ManagedAgent>();
   private readonly worktrees: WorktreeManager;
   private readonly runs = new Map<string, AbortController>();
-  private pendingSpawns = 0;
+  private readonly pendingSpawns = new Map<string, number>();
 
   constructor(
     private readonly config: CodexProConfig,
@@ -119,28 +121,54 @@ export class AgentManager {
     private readonly logger: CodexProLogger = noopLogger
   ) { this.worktrees = new WorktreeManager(config); }
 
-  list(): ManagedAgent[] { return [...this.agents.values()].map((agent) => ({ ...agent, session: { ...agent.session, messages: [] } })); }
-  get(id: string): ManagedAgent { const agent = this.agents.get(id); if (!agent) throw new CodexProError(`unknown subagent: ${id}`); return agent; }
-
-  private runningCount(): number {
-    return [...this.agents.values()].filter((agent) => agent.state === "running" || agent.state === "waiting").length;
+  list(clientId?: string): ManagedAgent[] {
+    return [...this.agents.values()]
+      .filter((agent) => !clientId || agent.clientId === clientId)
+      .map((agent) => ({ ...agent, session: { ...agent.session, messages: [] } }));
   }
 
-  private counts(): Record<string, unknown> {
+  get(id: string, clientId?: string): ManagedAgent {
+    const agent = this.agents.get(id);
+    if (!agent || (clientId && agent.clientId !== clientId)) throw new CodexProError(`unknown subagent: ${id}`);
+    return agent;
+  }
+
+  snapshot(): { agentCount: number; runningCount: number } {
+    return { agentCount: this.agents.size, runningCount: this.runningCount() };
+  }
+
+  private runningCount(clientId?: string): number {
+    return [...this.agents.values()].filter((agent) =>
+      (!clientId || agent.clientId === clientId) &&
+      (agent.state === "running" || agent.state === "waiting")
+    ).length;
+  }
+
+  private pendingSpawnCount(clientId?: string): number {
+    if (clientId) return this.pendingSpawns.get(clientId) ?? 0;
+    return [...this.pendingSpawns.values()].reduce((sum, value) => sum + value, 0);
+  }
+
+  private counts(clientId?: string): Record<string, unknown> {
+    const agents = [...this.agents.values()].filter((agent) => !clientId || agent.clientId === clientId);
     return {
-      agent_count: this.agents.size,
-      running_count: this.runningCount(),
-      active_run_count: this.runs.size,
-      pending_spawn_count: this.pendingSpawns,
-      active_agent_ids: [...this.agents.values()]
+      agent_count: agents.length,
+      running_count: this.runningCount(clientId),
+      active_run_count: agents.filter((agent) => this.runs.has(agent.id)).length,
+      pending_spawn_count: this.pendingSpawnCount(clientId),
+      active_agent_ids: agents
         .filter((agent) => agent.state === "running" || agent.state === "waiting")
-        .map((agent) => agent.id)
+        .map((agent) => agent.id),
+      runtime_agent_count: this.agents.size,
+      runtime_running_count: this.runningCount()
     };
   }
 
   private agentLogger(agent: ManagedAgent): CodexProLogger {
     const pageId = (agent.session as AgentSession & { pageId?: unknown }).pageId;
     return this.logger.child({
+      client_id: agent.clientId,
+      ...(agent.leaseId ? { lease_id: agent.leaseId } : {}),
       agent_id: agent.id,
       role: agent.role,
       backend: agent.backend,
@@ -208,39 +236,44 @@ export class AgentManager {
     }
   }
 
-  async spawn(workspace: Workspace, options: { task: string; role: AgentRole; paths?: string[]; context?: string; parentId?: string }): Promise<ManagedAgent> {
+  async spawn(workspace: Workspace, options: { task: string; role: AgentRole; paths?: string[]; context?: string; parentId?: string; clientId?: string; leaseId?: string }): Promise<ManagedAgent> {
+    const clientId = options.clientId ?? "legacy";
     this.logger.info("subagent_spawn_requested", {
+      client_id: clientId,
+      ...(options.leaseId ? { lease_id: options.leaseId } : {}),
       role: options.role,
       backend: this.backend.name,
       model: this.backend.model,
       workspace_root: workspace.root,
       workspace_handle: workspace.id,
       parent_agent_id: options.parentId ?? null,
-      ...this.counts()
+      ...this.counts(clientId)
     });
     if (!this.config.subagentsEnabled) throw new CodexProError("subagents are disabled");
-    if (this.runningCount() + this.pendingSpawns >= this.config.maxSubagents) {
+    if (this.runningCount(clientId) + this.pendingSpawnCount(clientId) >= this.config.maxSubagents) {
       this.logger.warn("subagent_spawn_rejected_max_concurrency", {
         role: options.role,
         backend: this.backend.name,
         max_subagents: this.config.maxSubagents,
         workspace_root: workspace.root,
-        ...this.counts()
+        ...this.counts(clientId)
       });
       throw new CodexProError(`maximum concurrent subagents reached (${this.config.maxSubagents})`);
     }
     if (options.parentId) throw new CodexProError(`recursive subagent spawning is disabled at the tool layer (max depth ${this.config.maxAgentDepth})`);
     if (!options.task.trim()) throw new CodexProError("subagent task is required");
-    this.pendingSpawns += 1;
+    this.pendingSpawns.set(clientId, this.pendingSpawnCount(clientId) + 1);
     this.logger.info("subagent_concurrency_slot_reserved", {
       role: options.role,
       backend: this.backend.name,
       max_subagents: this.config.maxSubagents,
-      ...this.counts()
+      ...this.counts(clientId)
     });
     try {
       const id = `agent-${randomUUID().slice(0, 8)}`;
       const spawnLogger = this.logger.child({
+        client_id: clientId,
+        ...(options.leaseId ? { lease_id: options.leaseId } : {}),
         agent_id: id,
         role: options.role,
         backend: this.backend.name,
@@ -292,6 +325,8 @@ export class AgentManager {
       });
       const agent: ManagedAgent = {
         id,
+        clientId,
+        leaseId: options.leaseId,
         role: options.role,
         backend: session.backend,
         model: session.model,
@@ -304,6 +339,7 @@ export class AgentManager {
         session
       };
       this.agents.set(id, agent);
+      this.agentLogger(agent).info("agent_ownership_changed", { previous_client_id: null, client_id: clientId, reason: "spawn", ...this.counts() });
       this.agentLogger(agent).info("subagent_registered", this.counts());
       this.startRun(agent, taskPrompt, "spawn");
       return this.get(id);
@@ -316,22 +352,24 @@ export class AgentManager {
       });
       throw error;
     } finally {
-      this.pendingSpawns -= 1;
-      this.logger.info("subagent_concurrency_slot_released", this.counts());
+      const pending = this.pendingSpawnCount(clientId) - 1;
+      if (pending > 0) this.pendingSpawns.set(clientId, pending);
+      else this.pendingSpawns.delete(clientId);
+      this.logger.info("subagent_concurrency_slot_released", this.counts(clientId));
     }
   }
 
-  async message(id: string, message: string): Promise<ManagedAgent> {
-    const agent = this.get(id);
+  async message(id: string, message: string, clientId?: string): Promise<ManagedAgent> {
+    const agent = this.get(id, clientId);
     if (agent.state === "cancelled") throw new CodexProError("subagent is cancelled");
     if (this.runs.has(id)) throw new CodexProError("subagent is still running; wait for completion before sending a follow-up");
     this.agentLogger(agent).info("subagent_followup_started", this.counts());
     this.startRun(agent, redactSensitiveText(message), "followup");
-    return this.get(id);
+    return this.get(id, clientId);
   }
 
-  async cancel(id: string): Promise<ManagedAgent> {
-    const agent = this.get(id);
+  async cancel(id: string, clientId?: string): Promise<ManagedAgent> {
+    const agent = this.get(id, clientId);
     const logger = this.agentLogger(agent);
     logger.info("subagent_cancellation_requested", this.counts());
     this.runs.get(id)?.abort();
@@ -339,15 +377,15 @@ export class AgentManager {
       await this.backend.cancel(agent.session.id);
       agent.state = "cancelled";
       logger.info("subagent_cancellation_completed", this.counts());
-      return this.get(id);
+      return this.get(id, clientId);
     } catch (error) {
       logger.error("subagent_cancellation_failed", error, this.counts());
       throw error;
     }
   }
 
-  cleanup(workspace: Workspace, id: string): void {
-    const agent = this.get(id);
+  cleanup(workspace: Workspace, id: string, clientId?: string): void {
+    const agent = this.get(id, clientId);
     const logger = this.agentLogger(agent);
     logger.info("subagent_cleanup_started", { has_worktree: Boolean(agent.worktree), ...this.counts() });
     try {
@@ -356,6 +394,26 @@ export class AgentManager {
     } catch (error) {
       logger.error("subagent_cleanup_failed", error, this.counts());
       throw error;
+    }
+  }
+
+  async releaseOwner(clientId: string, workspaceForRoot: (workspaceRoot: string) => Workspace): Promise<void> {
+    const owned = [...this.agents.values()].filter((agent) => agent.clientId === clientId);
+    for (const agent of owned) {
+      const logger = this.agentLogger(agent);
+      this.runs.get(agent.id)?.abort();
+      await this.backend.cancel(agent.session.id).catch((error) => logger.error("subagent_owner_cleanup_cancel_failed", error));
+      if (agent.worktree) {
+        try {
+          this.worktrees.remove(workspaceForRoot(agent.workspaceRoot), agent.worktree.id, { discardChanges: true });
+        } catch (error) {
+          logger.error("subagent_owner_cleanup_worktree_failed", error);
+        }
+      }
+      await this.backend.close?.(agent.session.id).catch((error) => logger.error("subagent_owner_cleanup_backend_close_failed", error));
+      this.runs.delete(agent.id);
+      this.agents.delete(agent.id);
+      logger.info("agent_ownership_changed", { previous_client_id: clientId, client_id: null, reason: "owner_cleanup", ...this.counts() });
     }
   }
 }

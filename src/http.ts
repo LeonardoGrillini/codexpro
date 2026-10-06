@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-import { randomUUID } from "node:crypto";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
@@ -19,7 +18,8 @@ import {
   type WorkspaceProfile
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
-import { ChatGPTBrowserManager } from "./chatgptBrowserManager.js";
+import { CodexProError } from "./guard.js";
+import { RuntimeCoordinator, normalizeClientId, type RuntimeClientHandle } from "./runtimeCoordinator.js";
 import { createCodexProServer } from "./server.js";
 import type { LogSnapshot } from "./logging.js";
 import { createCodexProLogger, withLogContext } from "./logging.js";
@@ -1491,13 +1491,8 @@ async function main(): Promise<void> {
   process.on("uncaughtExceptionMonitor", (error, origin) => {
     logger.error("runtime_uncaught_exception", error, { origin });
   });
-  const chatgptBrowserManager = new ChatGPTBrowserManager(config, undefined, undefined, { logger: logger.child({ subsystem: "chatgpt_browser" }) });
-  if (config.chatgptBrowserAutoStart) {
-    void chatgptBrowserManager.openOrFocus().catch((error) => {
-      logger.error("chatgpt_browser_auto_start_failed", error);
-      console.error(`[CodexPro] ChatGPT browser auto-start failed: ${redactSensitiveText(error instanceof Error ? error.message : String(error))}`);
-    });
-  }
+  const runtime = new RuntimeCoordinator(config, { logger });
+  const chatgptBrowserManager = runtime.chatgptBrowserManager;
   if (config.requireHttpToken && !config.authToken) {
     throw new Error(
       "CODEXPRO_HTTP_TOKEN is required for this HTTP binding. " +
@@ -1565,7 +1560,7 @@ async function main(): Promise<void> {
       next();
     });
   });
-  app.use(cors({ exposedHeaders: ["Mcp-Session-Id"] }));
+  app.use(cors({ exposedHeaders: ["Mcp-Session-Id", "CodexPro-Client-Id", "CodexPro-Lease-Id"] }));
   app.get("/favicon.ico", (_req, res) => {
     res.setHeader("Cache-Control", "public, max-age=86400");
     res.type("image/svg+xml").send(LOCAL_FAVICON);
@@ -1617,6 +1612,9 @@ async function main(): Promise<void> {
 
   type TransportRecord = {
     transport: StreamableHTTPServerTransport;
+    runtimeClient: RuntimeClientHandle;
+    clientId: string;
+    leaseId: string;
     createdAt: number;
     lastSeenAt: number;
     sessionId?: string;
@@ -1624,13 +1622,38 @@ async function main(): Promise<void> {
   };
 
   const transports = new Map<string, TransportRecord>();
-  // Remember explicit workspace IDs across reconnects, but keep selection per session.
-  const knownWorkspaceRoots = new Map<string, string>();
   const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   function requestSessionId(req: Request): string | undefined {
     const value = req.headers["mcp-session-id"];
     return Array.isArray(value) ? value[0] : value;
+  }
+
+  function headerValue(req: Request, name: string): string | undefined {
+    const value = req.headers[name];
+    return Array.isArray(value) ? value[0] : typeof value === "string" ? value : undefined;
+  }
+
+  function resolveClientIdentity(req: Request): { clientId: string; synthetic: boolean } {
+    const explicitHeader = headerValue(req, "codexpro-client-id") ?? headerValue(req, "x-codexpro-client-id");
+    const explicitQuery = typeof req.query.client_id === "string" ? req.query.client_id : undefined;
+    const explicit = explicitHeader ?? explicitQuery;
+    if (explicit) return { clientId: normalizeClientId(explicit), synthetic: false };
+
+    const clientInfo = req.body?.params?.clientInfo;
+    const fingerprint = JSON.stringify({
+      name: typeof clientInfo?.name === "string" ? clientInfo.name : "",
+      version: typeof clientInfo?.version === "string" ? clientInfo.version : "",
+      userAgent: headerValue(req, "user-agent") ?? "",
+      remote: req.ip || req.socket.remoteAddress || ""
+    });
+    const suffix = createHash("sha256").update(fingerprint).digest("hex").slice(0, 24);
+    return { clientId: "legacy-http-" + suffix, synthetic: true };
+  }
+
+  function setClientHeaders(res: Response, runtimeClient: RuntimeClientHandle): void {
+    res.setHeader("CodexPro-Client-Id", runtimeClient.clientId);
+    res.setHeader("CodexPro-Lease-Id", runtimeClient.leaseId);
   }
 
   function sendSessionError(res: Response, sessionId: string | undefined): void {
@@ -1650,7 +1673,12 @@ async function main(): Promise<void> {
   function closeTransport(record: TransportRecord, reason: string): void {
     if (record.closed) return;
     record.closed = true;
-    const transportLogger = logger.child({ mcp_session_id: record.sessionId ?? "uninitialized" });
+    if (record.sessionId) runtime.detachTransport(record.sessionId, reason);
+    const transportLogger = logger.child({
+      client_id: record.clientId,
+      lease_id: record.leaseId,
+      mcp_session_id: record.sessionId ?? "uninitialized"
+    });
     transportLogger.info("mcp_transport_close_requested", { reason, active_transport_count: transports.size });
     void Promise.resolve(record.transport.close?.())
       .then(() => transportLogger.info("mcp_transport_closed", { reason, active_transport_count: transports.size }))
@@ -1662,7 +1690,8 @@ async function main(): Promise<void> {
     for (const [sessionId, record] of transports) {
       if (now - record.lastSeenAt > config.httpSessionTtlMs) {
         transports.delete(sessionId);
-        logger.warn("mcp_transport_pruned", { mcp_session_id: sessionId, reason: "ttl", idle_ms: now - record.lastSeenAt, active_transport_count: transports.size });
+        logger.warn("mcp_transport_pruned", { client_id: record.clientId, lease_id: record.leaseId, mcp_session_id: sessionId, reason: "ttl", idle_ms: now - record.lastSeenAt, active_transport_count: transports.size });
+        logger.warn("abandoned_mcp_transport_pruned", { client_id: record.clientId, lease_id: record.leaseId, mcp_session_id: sessionId, reason: "ttl" });
         closeTransport(record, "ttl");
       }
     }
@@ -1670,7 +1699,8 @@ async function main(): Promise<void> {
       const oldest = [...transports.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt)[0];
       if (!oldest) break;
       transports.delete(oldest[0]);
-      logger.warn("mcp_transport_pruned", { mcp_session_id: oldest[0], reason: "capacity", active_transport_count: transports.size });
+      logger.warn("mcp_transport_pruned", { client_id: oldest[1].clientId, lease_id: oldest[1].leaseId, mcp_session_id: oldest[0], reason: "capacity", active_transport_count: transports.size });
+      logger.warn("abandoned_mcp_transport_pruned", { client_id: oldest[1].clientId, lease_id: oldest[1].leaseId, mcp_session_id: oldest[0], reason: "capacity" });
       closeTransport(oldest[1], "capacity");
     }
   }
@@ -1680,6 +1710,20 @@ async function main(): Promise<void> {
     pruneTransports();
     const record = transports.get(sessionId);
     if (!record) return undefined;
+    try {
+      const binding = runtime.noteTransportActivity(sessionId);
+      if (!binding) throw new CodexProError("logical client state is no longer attached");
+    } catch {
+      transports.delete(sessionId);
+      logger.warn("abandoned_mcp_transport_pruned", {
+        client_id: record.clientId,
+        lease_id: record.leaseId,
+        mcp_session_id: sessionId,
+        reason: "logical_state_missing"
+      });
+      closeTransport(record, "logical_state_missing");
+      return undefined;
+    }
     record.lastSeenAt = Date.now();
     return record.transport;
   }
@@ -1712,6 +1756,13 @@ async function main(): Promise<void> {
       contextDir: config.contextDir,
       authEnabled: Boolean(config.authToken),
       authRequired: Boolean(config.authToken),
+      clientLeaseTtlMs: config.clientLeaseTtlMs,
+      runtime: runtime.snapshot(),
+      transports: {
+        active: transports.size,
+        maxRetained: config.maxHttpSessions,
+        retentionTtlMs: config.httpSessionTtlMs
+      },
       logs: { runId: logger.runId, runDir: logger.runDir }
     });
   });
@@ -1771,20 +1822,51 @@ async function main(): Promise<void> {
       const existingTransport = getTransport(sessionId);
       if (existingTransport) {
         transport = existingTransport;
-        logger.info("mcp_transport_reused", { mcp_session_id: sessionId, active_transport_count: transports.size });
+        const record = sessionId ? transports.get(sessionId) : undefined;
+        if (record) {
+          setClientHeaders(res, record.runtimeClient);
+          logger.info("mcp_transport_reused", {
+            client_id: record.clientId,
+            lease_id: record.leaseId,
+            mcp_session_id: sessionId,
+            active_transport_count: transports.size
+          });
+        }
       } else if (!sessionId && isInitializeRequest(req.body)) {
+        const identity = resolveClientIdentity(req);
+        const runtimeClient = await runtime.registerClient(identity.clientId, {
+          adapter: "mcp-http",
+          synthetic: identity.synthetic
+        });
+        setClientHeaders(res, runtimeClient);
+        if (identity.synthetic) {
+          logger.warn("client_identity_synthesized", {
+            client_id: runtimeClient.clientId,
+            lease_id: runtimeClient.leaseId,
+            limitation: "legacy_identity_is_a_best_effort_fingerprint"
+          });
+        }
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
             pruneTransports();
             transports.set(newSessionId, {
               transport,
+              runtimeClient,
+              clientId: runtimeClient.clientId,
+              leaseId: runtimeClient.leaseId,
               createdAt: Date.now(),
               lastSeenAt: Date.now(),
               sessionId: newSessionId,
               closed: false
             });
-            logger.info("mcp_transport_session_initialized", { mcp_session_id: newSessionId, active_transport_count: transports.size });
+            runtime.attachTransport(runtimeClient.binding, newSessionId);
+            logger.info("mcp_transport_session_initialized", {
+              client_id: runtimeClient.clientId,
+              lease_id: runtimeClient.leaseId,
+              mcp_session_id: newSessionId,
+              active_transport_count: transports.size
+            });
             pruneTransports();
           }
         } as any);
@@ -1793,12 +1875,28 @@ async function main(): Promise<void> {
           const closedSessionId = (transport as any).sessionId;
           const record = closedSessionId ? transports.get(closedSessionId) : undefined;
           if (record) record.closed = true;
-          if (closedSessionId) transports.delete(closedSessionId);
-          logger.warn("mcp_transport_closed_by_sdk", { mcp_session_id: closedSessionId ?? null, active_transport_count: transports.size });
+          if (closedSessionId) {
+            transports.delete(closedSessionId);
+            runtime.detachTransport(closedSessionId, "sdk_close");
+          }
+          logger.warn("mcp_transport_closed_by_sdk", {
+            client_id: record?.clientId ?? runtimeClient.clientId,
+            lease_id: record?.leaseId ?? runtimeClient.leaseId,
+            mcp_session_id: closedSessionId ?? null,
+            active_transport_count: transports.size
+          });
         };
 
-        const server = createCodexProServer(config, knownWorkspaceRoots, { chatgptBrowserManager, logger });
-        logger.info("mcp_transport_created", { active_transport_count: transports.size });
+        const server = createCodexProServer(config, new Map<string, string>(), {
+          runtimeCoordinator: runtime,
+          runtimeClient,
+          logger
+        });
+        logger.info("mcp_transport_created", {
+          client_id: runtimeClient.clientId,
+          lease_id: runtimeClient.leaseId,
+          active_transport_count: transports.size
+        });
         await server.connect(transport);
       } else {
         sendSessionError(res, sessionId);
@@ -1810,9 +1908,12 @@ async function main(): Promise<void> {
       logger.error("mcp_request_failed", error, { mcp_session_id: requestSessionId(req) ?? null });
       console.error(error instanceof Error ? error.stack ?? error.message : String(error));
       if (!res.headersSent) {
-        res.status(500).json({
+        const invalidRequest = error instanceof CodexProError;
+        res.status(invalidRequest ? 400 : 500).json({
           jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal CodexPro MCP error. Check the local terminal for details." },
+          error: invalidRequest
+            ? { code: -32602, message: redactSensitiveText(error.message) }
+            : { code: -32603, message: "Internal CodexPro MCP error. Check the local terminal for details." },
           id: null
         });
       }
@@ -1826,7 +1927,14 @@ async function main(): Promise<void> {
       sendSessionError(res, sessionId);
       return;
     }
-    logger.info("mcp_transport_session_request", { mcp_session_id: sessionId, method: req.method });
+    const record = sessionId ? transports.get(sessionId) : undefined;
+    if (record) setClientHeaders(res, record.runtimeClient);
+    logger.info("mcp_transport_session_request", {
+      client_id: record?.clientId ?? null,
+      lease_id: record?.leaseId ?? null,
+      mcp_session_id: sessionId,
+      method: req.method
+    });
     await transport.handleRequest(req, res);
   };
 
@@ -1884,9 +1992,10 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info("runtime_shutdown_requested", { exit_code: exitCode, active_transport_count: transports.size });
+    clearInterval(pruneTimer);
     for (const record of transports.values()) closeTransport(record, "runtime_shutdown");
     transports.clear();
-    await chatgptBrowserManager.closeAll().catch((error) => logger.error("chatgpt_browser_shutdown_failed", error));
+    await runtime.shutdown().catch((error) => logger.error("runtime_coordinator_shutdown_failed", error));
     httpServer.close(() => {
       logger.info("http_server_closed", { exit_code: exitCode });
       process.exit(exitCode);

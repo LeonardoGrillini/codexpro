@@ -30,6 +30,7 @@ import type { CodexProLogger } from "./logging.js";
 import { noopLogger, withLogContext } from "./logging.js";
 import { VmManager, runVmToolAction } from "./vm/index.js";
 import { CODEXPRO_VERSION } from "./version.js";
+import { RuntimeCoordinator, type RuntimeClientHandle } from "./runtimeCoordinator.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -302,6 +303,7 @@ const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
 
 const registeredToolHandlersByServer = new WeakMap<object, Map<string, CodexToolHandler>>();
 const loggerByServer = new WeakMap<object, CodexProLogger>();
+const runtimeClientByServer = new WeakMap<object, RuntimeClientHandle>();
 
 function rememberRegisteredToolHandler(server: McpServer, name: string, handler: CodexToolHandler): void {
   const key = server as object;
@@ -348,8 +350,18 @@ function registerToolCompat(
   const wrapped = async (args: any) => {
     const started = Date.now();
     const toolCallId = randomUUID();
-    const logger = (loggerByServer.get(server as object) ?? noopLogger).child({ tool: name, tool_call_id: toolCallId });
-    return withLogContext({ tool: name, tool_call_id: toolCallId }, async () => {
+    const runtimeClient = runtimeClientByServer.get(server as object);
+    runtimeClient?.renew(toolCallId);
+    const requestContext = {
+      ...(typeof args?.workspace_id === "string" ? { workspace_id: args.workspace_id } : {}),
+      ...(name.startsWith("subagent_") && typeof args?.id === "string" ? { agent_id: args.id } : {}),
+      ...(name === "browser" && typeof args?.session_id === "string" ? { browser_session_id: args.session_id } : {})
+    };
+    const logicalContext = runtimeClient
+      ? { client_id: runtimeClient.clientId, lease_id: runtimeClient.leaseId, operation_id: toolCallId, ...requestContext }
+      : { operation_id: toolCallId, ...requestContext };
+    const logger = (loggerByServer.get(server as object) ?? noopLogger).child({ ...logicalContext, tool: name, tool_call_id: toolCallId });
+    return withLogContext({ ...logicalContext, tool: name, tool_call_id: toolCallId }, async () => {
       logger.info("mcp_tool_started");
       try {
         const result = tagToolResult(await handler(args ?? {}), name, options);
@@ -394,6 +406,8 @@ const MINIMAL_TOOL_NAMES = [
   "tree",
   "search",
   "git",
+  "runtime_status",
+  "shutdown_client",
   "reconnect_workspace",
   "read_output",
   SUPERTOOL_NAME,
@@ -427,6 +441,8 @@ const STANDARD_TOOL_NAMES = [
 ] as const;
 
 const FULL_TOOL_NAMES = [
+  "runtime_status",
+  "shutdown_client",
   "reconnect_workspace",
   "read_output",
   SUPERTOOL_NAME,
@@ -470,6 +486,7 @@ const FULL_TOOL_NAMES = [
 const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   SUPERTOOL_NAME,
   "codexpro_self_test",
+  "shutdown_client",
   "write",
   "edit",
   "apply_patch",
@@ -605,8 +622,8 @@ function serverInstructions(config: CodexProConfig): string {
     "",
     "Preferred workflow:",
     "Core repository tools stay registered together: open_current_workspace/open_workspace, tree, search, read, write/edit/apply_patch, show_changes, git, and bash when enabled.",
-    "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; that selection stays active for this MCP session.",
-    "2. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files. Keep its workspace_id on subsequent calls. After MCP reconnect use reconnect_workspace with that ID (and the original root after a server restart).",
+    "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; that selection belongs to the logical client and survives MCP transport reconnects until lease cleanup.",
+    "2. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files. Keep its workspace_id on subsequent calls. Ordinary MCP reconnects preserve logical-client state; use reconnect_workspace for migration/recovery or after a runtime restart, supplying the original root when needed.",
     "3. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction,
     bashInstruction,
@@ -1091,6 +1108,8 @@ const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructive
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
 export interface CodexProServerDependencies {
+  runtimeCoordinator?: RuntimeCoordinator;
+  runtimeClient?: RuntimeClientHandle;
   browserManager?: BrowserManager;
   agentBackend?: AgentBackend;
   chatgptBrowserManager?: ChatGPTBrowserManager;
@@ -1102,24 +1121,32 @@ export function createCodexProServer(
   knownWorkspaceRoots = new Map<string, string>(),
   dependencies: CodexProServerDependencies = {}
 ): McpServer {
-  const workspaces = new WorkspaceManager(config, knownWorkspaceRoots);
-  const outputs = new OutputStore();
-  const reviewCheckpoints = new Map<string, string>();
-  const guard = new PathGuard(config);
-  const gitService = new GitService(config, guard);
-  const worktreeManager = new WorktreeManager(config);
-  const browserManager = dependencies.browserManager ?? new BrowserManager(config, guard);
-  const logger = dependencies.logger ?? noopLogger;
-  const vmManager = new VmManager();
-  const backendSelection = dependencies.agentBackend
-    ? { backend: dependencies.agentBackend, chatgptBrowserManager: dependencies.chatgptBrowserManager }
-    : createAgentBackend(config, {
-        chatgptBrowserManager: dependencies.chatgptBrowserManager,
-        logger: logger.child({ subsystem: "chatgpt_browser" })
-      });
-  const agentManager = backendSelection ? new AgentManager(config, guard, backendSelection.backend, logger.child({ subsystem: "subagent" })) : undefined;
-  const chatgptBrowserManager = backendSelection?.chatgptBrowserManager ?? dependencies.chatgptBrowserManager;
-  if (config.chatgptBrowserAutoStart && chatgptBrowserManager && !dependencies.chatgptBrowserManager) {
+  const runtimeCoordinator = dependencies.runtimeCoordinator;
+  const runtimeClient = dependencies.runtimeClient;
+  if (Boolean(runtimeCoordinator) !== Boolean(runtimeClient)) {
+    throw new CodexProError("Runtime coordinator and logical client binding must be supplied together.");
+  }
+  const workspaces = runtimeClient?.workspaceManager ?? new WorkspaceManager(config, knownWorkspaceRoots);
+  const outputs = runtimeClient?.outputStore ?? new OutputStore();
+  const reviewCheckpoints = runtimeClient?.reviewCheckpoints ?? new Map<string, string>();
+  const guard = runtimeCoordinator?.guard ?? new PathGuard(config);
+  const gitService = runtimeCoordinator?.gitService ?? new GitService(config, guard);
+  const worktreeManager = runtimeCoordinator?.worktreeManager ?? new WorktreeManager(config);
+  const browserManager = runtimeCoordinator?.browserManager ?? dependencies.browserManager ?? new BrowserManager(config, guard);
+  const browserOwnerId = runtimeClient?.browserOwnerId() ?? "legacy";
+  const logger = (dependencies.logger ?? noopLogger).child(runtimeClient ? { client_id: runtimeClient.clientId, lease_id: runtimeClient.leaseId } : {});
+  const vmManager = runtimeCoordinator?.vmManager ?? new VmManager();
+  const backendSelection = runtimeCoordinator
+    ? undefined
+    : dependencies.agentBackend
+      ? { backend: dependencies.agentBackend, chatgptBrowserManager: dependencies.chatgptBrowserManager }
+      : createAgentBackend(config, {
+          chatgptBrowserManager: dependencies.chatgptBrowserManager,
+          logger: logger.child({ subsystem: "chatgpt_browser" })
+        });
+  const agentManager = runtimeCoordinator?.agentManager ?? (backendSelection ? new AgentManager(config, guard, backendSelection.backend, logger.child({ subsystem: "subagent" })) : undefined);
+  const chatgptBrowserManager = runtimeCoordinator?.chatgptBrowserManager ?? backendSelection?.chatgptBrowserManager ?? dependencies.chatgptBrowserManager;
+  if (!runtimeCoordinator && config.chatgptBrowserAutoStart && chatgptBrowserManager && !dependencies.chatgptBrowserManager) {
     void chatgptBrowserManager.openOrFocus().catch((error) => {
       logger.error("chatgpt_browser_auto_start_failed", error);
       console.error(`[CodexPro] ChatGPT browser auto-start failed: ${errorText(error)}`);
@@ -1127,13 +1154,53 @@ export function createCodexProServer(
   }
   const server = new McpServer({ name: "CodexPro", version: CODEXPRO_VERSION }, { instructions: serverInstructions(config) });
   loggerByServer.set(server as object, logger);
+  if (runtimeClient) runtimeClientByServer.set(server as object, runtimeClient);
   logger.info("mcp_server_created", { tool_mode: config.toolMode, subagent_provider: config.subagentProvider });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);
 
+  registerCodexTool(config, server, "runtime_status", {
+    title: "Runtime Status",
+    description: "Inspect this logical client's stable identity, lease, and process-wide runtime counts. MCP transport counts are reported separately from logical client and agent counts.",
+    inputSchema: {},
+    annotations: READ_ONLY_ANNOTATIONS
+  }, async () => {
+    const snapshot = runtimeCoordinator?.snapshot() ?? {
+      logicalClientCount: runtimeClient ? 1 : 0,
+      activeLeaseCount: runtimeClient ? 1 : 0,
+      logicalAgentCount: agentManager?.snapshot().agentCount ?? 0,
+      runningAgentCount: agentManager?.snapshot().runningCount ?? 0,
+      browserSessionCount: browserManager.count(browserOwnerId),
+      attachedTransportCount: 0
+    };
+    return textResult(`Logical client: ${runtimeClient?.clientId ?? "legacy"}\nLease: ${runtimeClient?.leaseId ?? "legacy"}\nRuntime: ${JSON.stringify(snapshot)}`, {
+      client_id: runtimeClient?.clientId ?? null,
+      lease_id: runtimeClient?.leaseId ?? null,
+      runtime: snapshot
+    });
+  });
+
+  registerCodexTool(config, server, "shutdown_client", {
+    title: "Shutdown Logical Client",
+    description: "Explicitly release this logical client's lease and deterministically clean up its agents, browser pages, worktrees, cancellation state, and transport attachments. The MCP connection is not the owner of that state.",
+    inputSchema: {},
+    annotations: LOCAL_WRITE_ANNOTATIONS
+  }, async () => {
+    if (!runtimeClient || !runtimeCoordinator) throw new CodexProError("Explicit logical-client shutdown is unavailable in legacy standalone server mode.");
+    const clientId = runtimeClient.clientId;
+    const leaseId = runtimeClient.leaseId;
+    await runtimeClient.shutdown();
+    return textResult(`Logical client ${clientId} shut down.`, {
+      client_id: clientId,
+      lease_id: leaseId,
+      released: true,
+      runtime: runtimeCoordinator.snapshot()
+    });
+  });
+
   registerCodexTool(config, server, "reconnect_workspace", {
     title: "Reconnect Workspace",
-    description: "Validate and select a previously opened workspace by ID after MCP reconnect. Supply its original root after a server restart. Does not repair the host connector or retry commands.",
+    description: "Validate and select a previously opened workspace by ID for migration/recovery or after a runtime restart. Ordinary MCP transport reconnects preserve the logical client workspace automatically. Supply the original root after a server restart. Does not repair the host connector or retry commands.",
     inputSchema: { workspace_id: z.string(), root: z.string().optional() },
     annotations: SESSION_READ_ANNOTATIONS
   }, async (args) => {
@@ -1148,7 +1215,7 @@ export function createCodexProServer(
 
   registerCodexTool(config, server, "read_output", {
     title: "Read Command Output",
-    description: "Read retained, redacted shell output by character offset. Follow next_offset until null. Last four shell outputs are retained in this MCP session, up to 2 MB each; incomplete means execution hit a capture limit or timeout.",
+    description: "Read retained, redacted shell output by character offset. Follow next_offset until null. Last four shell outputs are retained for this logical client, up to 2 MB each; incomplete means execution hit a capture limit or timeout.",
     inputSchema: {
       workspace_id: z.string().optional(), output_resource_id: z.string(),
       stream: z.enum(["stdout", "stderr"]).optional(),
@@ -1350,7 +1417,7 @@ export function createCodexProServer(
       description:
         "Run one controlled, local-only CodexPro diagnostic. It checks modes, expected tools, workspace access, skills, git, safe bash policy, selected-only Pro context, and optional .ai-bridge write/edit probe without touching source files.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         write_probe: z.boolean().optional().describe("Create/edit only .ai-bridge/codexpro-self-test.md. Default: true."),
         bash_probe: z.boolean().optional().describe("Check bash policy with safe local commands only. Default: true."),
         pro_context_probe: z.boolean().optional().describe("Build a selected-only Pro context bundle in memory without writing pro-context.md. Default: true."),
@@ -1576,7 +1643,7 @@ export function createCodexProServer(
       description:
         "List CodexPro modes plus discovered skill names and configured MCP server names. Use this early when planning needs local agent capabilities.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         include_global_skills: z.boolean().optional().describe("Include user and plugin skill folders. Default: true."),
         include_mcp_servers: z.boolean().optional().describe("Include configured MCP server names from safe config files. Default: true."),
         max_skills: z.number().int().min(1).max(500).optional().describe("Maximum skills to list. Default: 120.")
@@ -1619,7 +1686,7 @@ export function createCodexProServer(
       description:
         "Load the bounded SKILL.md body for a discovered workspace, user, or plugin skill by name. Does not accept arbitrary paths; use after open_current_workspace/open_workspace shows skill_inventory.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         name: z.string().describe("Exact skill name from skill_inventory or codexpro_inventory."),
         source: z.enum(["workspace", "user", "plugin", "other"]).optional().describe("Optional source override. Without it, the highest-precedence skill is loaded."),
         path: z.string().optional().describe("Optional exact sanitized path override for diagnostics or an explicitly selected suppressed duplicate."),
@@ -1669,7 +1736,7 @@ export function createCodexProServer(
     "list_workspaces",
     {
       title: "List Workspaces",
-      description: "List workspaces opened in this MCP session and identify the currently selected workspace.",
+      description: "List workspaces opened in this logical client and identify the currently selected workspace.",
       inputSchema: {},
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
@@ -1699,7 +1766,7 @@ export function createCodexProServer(
     {
       title: "Open Current Workspace",
       description:
-        "Open and select the configured default workspace for this MCP session. Use this to return to the launch workspace after switching roots.",
+        "Open and select the configured default workspace for this logical client. Use this to return to the launch workspace after switching roots.",
       inputSchema: {
         include_tree: z.boolean().optional().describe("Include a compact file tree. Default: false for speed."),
         max_depth: z.number().int().min(1).max(8).optional().describe("Tree depth when include_tree=true. Default: 1 for shallow project discovery."),
@@ -1750,7 +1817,7 @@ export function createCodexProServer(
     {
       title: "Open Workspace",
       description:
-        "Open and select an allowed local project for this MCP session. Later tool calls may omit workspace_id to use this selection.",
+        "Open and select an allowed local project for this logical client. Later tool calls may omit workspace_id to use this selection.",
       inputSchema: {
         root: z.string().optional().describe("Project directory to open. Omit to use CODEXPRO_ROOT/current working directory. Supports ~/ paths."),
         path: z.string().optional().describe("Alias for root. Useful for clients that naturally send path instead of root."),
@@ -1809,7 +1876,7 @@ export function createCodexProServer(
       title: "Workspace Snapshot",
       description: "Return git status, recent commits, .ai-bridge context, and a compact tree for an opened workspace.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         max_depth: z.number().int().min(1).max(8).optional().describe("Tree depth. Default: 2 for a compact project overview."),
         max_files: z.number().int().min(1).max(3000).optional().describe("Alias for maximum tree entries. Default: 250."),
         include_skills: z.boolean().optional().describe("Discover repo-local skills. Default: false for speed."),
@@ -1861,7 +1928,7 @@ export function createCodexProServer(
       title: "Inspect Workspace",
       description: "Build a compact repository map with architecture, project summaries, entrypoints, important files, and coverage. Detailed files, symbols, and relationships are bounded and demand-driven.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         path: z.string().optional().describe("Optional workspace-relative area to emphasize. Default: entire workspace."),
         max_files: z.number().int().min(1).max(100000).optional().describe("Maximum returned file records. Default: 120."),
         include_symbols: z.boolean().optional().describe("Include symbols in structured output. Default: false; max_symbols also opts in unless explicitly disabled."),
@@ -1966,7 +2033,7 @@ export function createCodexProServer(
       title: "File Tree",
       description: "List files and directories inside the workspace, excluding blocked paths.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         path: z.string().optional().describe("Directory relative to workspace root. Default: ."),
         max_depth: z.number().int().min(1).max(12).optional().describe("Maximum depth. Default: 4."),
         include_hidden: z.boolean().optional().describe("Include dotfiles/dotfolders that are not blocked. Default: false."),
@@ -1999,7 +2066,7 @@ export function createCodexProServer(
       title: "Search Files",
       description: "Use this for targeted verification or code lookup. Prefer one specific final search instead of repeated broad verification searches.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         query: z.string().describe("Text or regex to search for."),
         regex: z.boolean().optional().describe("Treat query as a regular expression. Requires ripgrep. Default: false."),
         case_sensitive: z.boolean().optional().describe("Case-sensitive lexical search. Default: true."),
@@ -2056,7 +2123,7 @@ export function createCodexProServer(
       title: "Read File",
       description: "Read a specific text file with line numbers. Avoid rereading files after write/edit/apply_patch unless exact final content is needed.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         path: z.string().describe("File path relative to workspace root."),
         start_line: z.number().int().min(1).optional().describe("First line to read. Default: 1."),
         end_line: z.number().int().min(1).optional().describe("Last line to read. Default: end of file."),
@@ -2089,7 +2156,7 @@ export function createCodexProServer(
       title: "View Image",
       description: "Inspect a PNG, JPEG, GIF, or WebP image from the active workspace. Returns native MCP image content plus dimensions and SHA-256.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         path: z.string().describe("Image path relative to workspace root."),
         max_bytes: z.number().int().min(4096).max(2000000).optional().describe("Maximum image bytes. Default: at least 1 MB, capped at 2 MB.")
       },
@@ -2129,7 +2196,7 @@ export function createCodexProServer(
       title: "Write File",
       description: "Create or overwrite a meaningful text file inside the workspace. New files use an atomic rename; existing files retain their inode and metadata. Returns a unified diff; pass the SHA from read when overwriting shared files.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         path: z.string().describe("File path relative to workspace root."),
         content: z.string().describe("Complete file contents to write."),
         create_dirs: z.boolean().optional().describe("Create parent directories if missing. Default: true."),
@@ -2176,7 +2243,7 @@ export function createCodexProServer(
       title: "Edit File",
       description: "Apply a targeted exact text replacement while retaining the existing file inode and metadata. Returns a unified diff; pass the SHA from read to reject stale multi-session edits.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         path: z.string().describe("File path relative to workspace root."),
         old_text: z.string().describe("Exact text to replace. Must match once unless replace_all=true."),
         new_text: z.string().describe("Replacement text."),
@@ -2225,7 +2292,7 @@ export function createCodexProServer(
       description:
         "Apply one unified diff patch inside the workspace. Paths are validated before applying. Prefer edit for tiny replacements and apply_patch for multi-file diffs.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         patch: z.string().describe("Unified diff patch to apply. File paths must stay inside the workspace and avoid blocked paths.")
       },
       annotations: LOCAL_WRITE_ANNOTATIONS,
@@ -2270,7 +2337,7 @@ export function createCodexProServer(
       description:
         "Import a ChatGPT Apps SDK attachment into the workspace. Accepts only a platform file object with download_url and file_id. Not a general URL downloader. Overwrite is off by default.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         file: z
           .object({
             download_url: z.string().describe("Temporary HTTPS download URL provided by ChatGPT."),
@@ -2340,7 +2407,7 @@ export function createCodexProServer(
       description:
         "Run a local development command in the workspace. In safe mode, ordinary compilers, package managers, test runners, scripts, and command chains are allowed while obviously catastrophic filesystem, disk, system, and destructive Git operations are blocked. Prefer structured Git and file tools when they cover the operation.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         command: z.string().describe("Command to run."),
         shell: z.enum(["auto", "bash", "powershell", "cmd", "wsl"]).optional().describe("auto uses PowerShell on Windows and Bash on Linux/macOS/WSL. wsl runs Bash in the configured Windows WSL distribution. Use syntax appropriate to the selected shell."),
         session_id: z.string().optional().describe(config.requireBashSession && config.bashSessionId ? `Required bash session id for this server: ${config.bashSessionId}.` : "Optional bash session id. If configured on the server, a provided value must match it."),
@@ -2382,7 +2449,7 @@ export function createCodexProServer(
       title: "Git Status",
       description: "Show git branch and changed files for the workspace.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         path: z.string().optional().describe("Optional file path relative to workspace root.")
       },
       annotations: READ_ONLY_ANNOTATIONS,
@@ -2418,7 +2485,7 @@ export function createCodexProServer(
       title: "Git Diff",
       description: "Show current unstaged or staged git diff, optionally scoped to a file.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         path: z.string().optional().describe("Optional file path relative to workspace root."),
         staged: z.boolean().optional().describe("Show staged diff. Default: false."),
         include_diff: z.boolean().optional().describe("Include the raw unified diff in the response. Default: true. Set false for stats-only checks.")
@@ -2518,7 +2585,7 @@ export function createCodexProServer(
     "browser",
     {
       title: "Browser",
-      description: "Operate an isolated Playwright Chromium session. Browser state is isolated per session and credentials/cookies are never inherited automatically. The screenshot action returns native MCP image content and also saves the image in the workspace.",
+      description: "Operate an isolated Playwright Chromium session owned by the stable logical client. MCP reconnects do not create a new browser owner, and credentials/cookies are never inherited automatically. The screenshot action returns native MCP image content and also saves the image in the workspace.",
       inputSchema: {
         workspace_id: z.string().optional(), action: z.enum(["open", "navigate", "snapshot", "click", "type", "select", "scroll", "wait", "tab", "screenshot", "close", "list"]),
         session_id: z.string().optional(), url: z.string().optional(), selector: z.string().optional(), text: z.string().optional(), submit: z.boolean().optional(), values: z.array(z.string()).optional(),
@@ -2530,21 +2597,22 @@ export function createCodexProServer(
     async (args) => {
       const action = args.action as string; const id = String(args.session_id ?? ""); const workspace = workspaces.getWorkspace(args.workspace_id); let result: any;
       switch (action) {
-        case "open": result = await browserManager.open(args.session_id, args.url); break;
-        case "navigate": result = await browserManager.navigate(id, String(args.url ?? "")); break;
-        case "snapshot": result = await browserManager.snapshot(id); break;
-        case "click": result = await browserManager.click(id, String(args.selector ?? "")); break;
-        case "type": result = await browserManager.type(id, String(args.selector ?? ""), String(args.text ?? ""), parseBool(args.submit, false)); break;
-        case "select": result = await browserManager.select(id, String(args.selector ?? ""), args.values ?? []); break;
-        case "scroll": result = await browserManager.scroll(id, Number(args.x ?? 0), Number(args.y ?? 600)); break;
-        case "wait": result = await browserManager.wait(id, args.selector, args.timeout_ms); break;
-        case "tab": result = await browserManager.tab(id, args.tab_action ?? "list", args.index); break;
+        case "open": result = await browserManager.open(args.session_id, args.url, browserOwnerId); break;
+        case "navigate": result = await browserManager.navigate(id, String(args.url ?? ""), browserOwnerId); break;
+        case "snapshot": result = await browserManager.snapshot(id, browserOwnerId); break;
+        case "click": result = await browserManager.click(id, String(args.selector ?? ""), browserOwnerId); break;
+        case "type": result = await browserManager.type(id, String(args.selector ?? ""), String(args.text ?? ""), parseBool(args.submit, false), browserOwnerId); break;
+        case "select": result = await browserManager.select(id, String(args.selector ?? ""), args.values ?? [], browserOwnerId); break;
+        case "scroll": result = await browserManager.scroll(id, Number(args.x ?? 0), Number(args.y ?? 600), browserOwnerId); break;
+        case "wait": result = await browserManager.wait(id, args.selector, args.timeout_ms, browserOwnerId); break;
+        case "tab": result = await browserManager.tab(id, args.tab_action ?? "list", args.index, browserOwnerId); break;
         case "screenshot": {
           const screenshot = await browserManager.screenshot(
             id,
             workspace,
             String(args.output_path ?? `${config.contextDir}/browser-${Date.now()}.png`),
-            parseBool(args.full_page, true)
+            parseBool(args.full_page, true),
+            browserOwnerId
           );
           const { data, mimeType, ...details } = screenshot;
           return {
@@ -2558,8 +2626,8 @@ export function createCodexProServer(
             structuredContent: redactStructured({ workspace_id: workspace.id, action, result: details })
           };
         }
-        case "close": await browserManager.close(id); result = { closed: id }; break;
-        case "list": result = { sessions: browserManager.list() }; break;
+        case "close": await browserManager.close(id, browserOwnerId); result = { closed: id }; break;
+        case "list": result = { sessions: browserManager.list(browserOwnerId) }; break;
         default: throw new CodexProError(`Unsupported browser action: ${action}`);
       }
       return textResult(`# Browser ${action}\n\n${JSON.stringify(result, null, 2)}`, { workspace_id: workspace.id, action, result });
@@ -2579,7 +2647,7 @@ export function createCodexProServer(
     async (args) => {
       if (!agentManager) throw new CodexProError("Subagents are unavailable for the selected provider.");
       const workspace = workspaces.getWorkspace(args.workspace_id);
-      const agent = await agentManager.spawn(workspace, { task: args.task, role: args.role, paths: args.paths, context: args.context });
+      const agent = await agentManager.spawn(workspace, { task: args.task, role: args.role, paths: args.paths, context: args.context, clientId: runtimeClient?.clientId, leaseId: runtimeClient?.leaseId });
       return textResult(`# Subagent ${agent.id}\n\nState: ${agent.state}\nRole: ${agent.role}\nSummary: ${agent.result?.summary ?? agent.error ?? "no result"}\n\nUNTRUSTED: verify source, diff, tests, Git state, and browser evidence independently.`, { id: agent.id, state: agent.state, role: agent.role, backend: agent.backend, model: agent.model, worktree: agent.worktree ?? null, external_conversation: agent.session.externalConversation ?? null, result: agent.result ?? null, error: agent.error ?? null, untrusted: true });
     }
   );
@@ -2588,7 +2656,7 @@ export function createCodexProServer(
     title: "Message Subagent", description: "Send a follow-up to the same persistent subagent session/conversation.", inputSchema: { id: z.string(), message: z.string() }, annotations: BASH_ANNOTATIONS
   }, async (args) => {
     if (!agentManager) throw new CodexProError("Subagents are unavailable for the selected provider.");
-    const agent = await agentManager.message(args.id, args.message);
+    const agent = await agentManager.message(args.id, args.message, runtimeClient?.clientId);
     return textResult(`# Subagent ${agent.id}\n\nState: ${agent.state}\nSummary: ${agent.result?.summary ?? agent.error ?? "no result"}`, { id: agent.id, state: agent.state, backend: agent.backend, model: agent.model, external_conversation: agent.session.externalConversation ?? null, result: agent.result ?? null, error: agent.error ?? null, untrusted: true });
   });
 
@@ -2596,7 +2664,7 @@ export function createCodexProServer(
     title: "Subagent Status", description: "Inspect one or all subagent states.", inputSchema: { id: z.string().optional() }, annotations: READ_ONLY_ANNOTATIONS
   }, async (args) => {
     if (!agentManager) throw new CodexProError("Subagents are unavailable for the selected provider.");
-    const agents = args.id ? [agentManager.get(args.id)] : agentManager.list();
+    const agents = args.id ? [agentManager.get(args.id, runtimeClient?.clientId)] : agentManager.list(runtimeClient?.clientId);
     const status = agents.map((agent) => ({ id: agent.id, role: agent.role, state: agent.state, backend: agent.backend, model: agent.model, created_at: agent.createdAt, worktree: agent.worktree ?? null, external_conversation: agent.session.externalConversation ?? null, error: agent.error ?? null }));
     return textResult(`# Subagent Status\n\n${JSON.stringify(status, null, 2)}`, { agents: status });
   });
@@ -2605,7 +2673,7 @@ export function createCodexProServer(
     title: "Subagent Result", description: "Return the latest evidence-oriented subagent result. Always independently verify it.", inputSchema: { id: z.string() }, annotations: READ_ONLY_ANNOTATIONS
   }, async (args) => {
     if (!agentManager) throw new CodexProError("Subagents are unavailable for the selected provider.");
-    const agent = agentManager.get(args.id);
+    const agent = agentManager.get(args.id, runtimeClient?.clientId);
     return textResult(`# Subagent Result ${agent.id}\n\n${agent.result?.rawResponse ?? agent.error ?? "No result yet."}\n\nUNTRUSTED: independently verify all claims.`, { id: agent.id, state: agent.state, backend: agent.backend, model: agent.model, external_conversation: agent.session.externalConversation ?? null, result: agent.result ?? null, error: agent.error ?? null, untrusted: true });
   });
 
@@ -2614,9 +2682,9 @@ export function createCodexProServer(
     inputSchema: { id: z.string(), workspace_id: z.string().optional(), cleanup_worktree: z.boolean().optional() }, annotations: LOCAL_WRITE_ANNOTATIONS
   }, async (args) => {
     if (!agentManager) throw new CodexProError("Subagents are unavailable for the selected provider.");
-    const agent = await agentManager.cancel(args.id);
+    const agent = await agentManager.cancel(args.id, runtimeClient?.clientId);
     const cleanup = parseBool(args.cleanup_worktree, false);
-    if (cleanup && agent.worktree) agentManager.cleanup(workspaces.getWorkspace(args.workspace_id), agent.id);
+    if (cleanup && agent.worktree) agentManager.cleanup(workspaces.getWorkspace(args.workspace_id), agent.id, runtimeClient?.clientId);
     return textResult(`# Subagent Cancelled\n\n${agent.id}${cleanup && agent.worktree ? "\nOwned worktree cleaned up." : ""}`, { id: agent.id, state: agent.state, worktree_cleaned: cleanup && Boolean(agent.worktree) });
   });
 
@@ -2628,7 +2696,7 @@ export function createCodexProServer(
       title: "Show Changes",
       description: "Summarize the current workspace changes in one review-oriented result with git status, diff stats, and optional diff. Use this instead of bash git status, bash git diff, git_status, or git_diff when reviewing work.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         path: z.string().optional().describe("Optional file path relative to workspace root."),
         staged: z.boolean().optional().describe("Show staged diff. Default: false."),
         include_diff: z.boolean().optional().describe("Include the unified diff. Default: true."),
@@ -2752,7 +2820,7 @@ export function createCodexProServer(
       title: "Read Handoff",
       description: "Read the shared .ai-bridge planning files used for ChatGPT-to-agent coordination.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session.")
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client.")
       },
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
@@ -2783,7 +2851,7 @@ export function createCodexProServer(
       description:
         "Read-only long-poll of the local handoff run state so ChatGPT can stay the planner/reviewer while a local executor runs. Reads .ai-bridge/handoff-run-state.json and returns the run status plus status/diff/log/test excerpts. It never starts processes or runs shell commands; it only observes local handoff state written by execute-handoff/watch-handoff/loop-handoff.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         plan_hash: z.string().optional().describe("Expected current-plan.md hash. If set, only a terminal run with this plan_hash counts as completed."),
         since_iteration: z.number().int().min(0).optional().describe("Only treat a run with iteration greater than this as the awaited completion."),
         max_wait_seconds: z.number().int().min(1).max(60).optional().describe("Maximum seconds to long-poll before returning the current state. Default: 20."),
@@ -2952,7 +3020,7 @@ export function createCodexProServer(
       description:
         "Load Codex-style workspace context in one call: AGENTS instructions for a target path, .ai-bridge handoff files, and optional git status/diff.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         target_path: z.string().optional().describe("Workspace-relative file or directory whose AGENTS instruction chain should be loaded. Default: ."),
         include_ai_bridge: z.boolean().optional().describe("Include .ai-bridge plan, agent status, diff, decisions, questions, and execution log. Default: true."),
         include_git: z.boolean().optional().describe("Include git status. Default: true."),
@@ -3001,7 +3069,7 @@ export function createCodexProServer(
       description:
         "Create .ai-bridge/pro-context.md with repo tree, git state, selected files, and handoff context for high-context ChatGPT planning without live MCP tool calls.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         title: z.string().optional().describe("Markdown title for the context bundle."),
         selected_paths: z.array(z.string()).optional().describe("Specific workspace-relative files to include."),
         extra_globs: z.array(z.string()).optional().describe("Additional workspace-relative glob patterns to include, for example src/**/*.ts."),
@@ -3152,7 +3220,7 @@ export function createCodexProServer(
       description:
         "Write .ai-bridge/current-plan.md for Codex, OpenCode, Pi, or another local implementation agent. This only creates handoff files; it does not execute local agent commands.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         agent: z.string().optional().describe("Target agent id, for example codex, opencode, pi, or custom. Default: custom."),
         agent_name: z.string().optional().describe("Human-readable agent name for custom agents."),
         model: z.string().optional().describe("Optional model identifier to include in the handoff plan."),
@@ -3219,7 +3287,7 @@ ${result.prompt}
       title: "Handoff To Codex",
       description: "Compatibility wrapper for handoff_to_agent with agent=codex.",
       inputSchema: {
-        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this logical client."),
         title: z.string().optional().describe("Short task title."),
         plan: z.string().describe("Detailed implementation plan for Codex."),
         append: z.boolean().optional().describe("Append to existing current-plan.md instead of overwriting. Default: false.")

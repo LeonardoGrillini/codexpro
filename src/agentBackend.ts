@@ -29,4 +29,5 @@ export interface AgentBackend {
   create(options: AgentOptions): Promise<AgentSession>;
   send(session: AgentSession, message: string, signal?: AbortSignal): Promise<AgentMessage>;
   cancel(sessionId: string): Promise<void>;
+  close?(sessionId: string): Promise<void>;
 }

@@ -509,11 +509,13 @@ try {
 
   const cliSource = await fs.readFile(path.resolve(oldCwd, 'scripts', 'codexpro.mjs'), 'utf8');
   const httpSource = await fs.readFile(path.resolve(oldCwd, 'src', 'http.ts'), 'utf8');
+  const runtimeSource = await fs.readFile(path.resolve(oldCwd, 'src', 'runtimeCoordinator.ts'), 'utf8');
   const managerSource = await fs.readFile(path.resolve(oldCwd, 'src', 'chatgptBrowserManager.ts'), 'utf8');
   assert.match(cliSource, /normalized === 'b'/);
   assert.match(cliSource, /requestChatgptBrowserOpen\(details\)/);
   assert.match(cliSource, /Start the CodexPro ChatGPT browser automatically when CodexPro starts\?/);
-  assert.match(httpSource, /chatgptBrowserManager\.closeAll\(\)/);
+  assert.match(httpSource, /runtime\.shutdown\(\)/);
+  assert.match(runtimeSource, /chatgptBrowserManager\.closeAll\(\)/);
   assert.match(managerSource, /chromium\.connectOverCDP\(/);
   assert.doesNotMatch(managerSource, /launchPersistentContext|AutomationControlled|storageState|\.cookies\s*\(/);
 

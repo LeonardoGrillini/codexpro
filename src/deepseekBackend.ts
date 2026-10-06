@@ -51,4 +51,5 @@ export class DeepSeekBackend implements AgentBackend {
   }
 
   async cancel(sessionId: string): Promise<void> { this.controllers.get(sessionId)?.abort(); }
+  async close(sessionId: string): Promise<void> { this.controllers.get(sessionId)?.abort(); this.controllers.delete(sessionId); }
 }

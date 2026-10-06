@@ -49,4 +49,8 @@ export class ChatGPTBrowserBackend implements AgentBackend {
   async cancel(sessionId: string): Promise<void> {
     await this.browser.cancel(sessionId);
   }
+
+  async close(sessionId: string): Promise<void> {
+    await this.browser.closeAgentPage(sessionId);
+  }
 }
