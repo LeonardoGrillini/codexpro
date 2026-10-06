@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { VmManager, backendForPlatform, parseImageManifest, parseInstanceRecord } from '../dist/vm/index.js';
+import { VmManager, backendForPlatform, createAnswerIsoBuffer, createWindowsUnattendXml, parseImageManifest, parseInstanceRecord, validateWindowsUsername } from '../dist/vm/index.js';
 import { HypervBackend, hypervName, hypervState } from '../dist/vm/backends/hyperv/hypervBackend.js';
 import { HypervPowerShell, hypervScripts } from '../dist/vm/backends/hyperv/powershell.js';
 
@@ -28,7 +28,10 @@ assert.ok(hypervScripts.create.indexOf('Set-VMKeyProtector') < hypervScripts.cre
 assert.ok(hypervScripts.create.indexOf('Enable-VMTPM') < hypervScripts.create.indexOf('Add-VMDvdDrive'));
 for (const cmdlet of ['Set-VMKeyProtector', 'Get-VMKeyProtector', 'Enable-VMTPM', 'Get-VMSecurity']) assert.ok(hypervScripts.doctor.includes(cmdlet));
 assert.match(hypervScripts.create, /Add-VMDvdDrive -VM \$vm -Path \$p.iso -Passthru/);
+assert.match(hypervScripts.create, /Add-VMDvdDrive -VM \$vm -Path \$p.unattendIso/);
 assert.match(hypervScripts.create, /Set-VMFirmware -VM \$vm -FirstBootDevice \$dvd/);
+assert.match(hypervScripts.inspectIso, /sources\\install\.wim/);
+assert.match(hypervScripts.inspectIso, /Dismount-DiskImage/);
 assert.match(hypervScripts.create, /Disconnect-VMNetworkAdapter/);
 assert.doesNotMatch(hypervScripts.create, /-SwitchName/);
 assert.match(hypervScripts.create, /-EnableSecureBoot On -SecureBootTemplate 'MicrosoftWindows'/);
@@ -40,6 +43,21 @@ assert.match(hypervScripts.destroy, /ownership could not be verified/);
 assert.ok(hypervScripts.destroy.indexOf('ownership could not be verified') < hypervScripts.destroy.indexOf('Stop-VM'));
 assert.ok(hypervScripts.destroy.indexOf('Stop-VM') < hypervScripts.destroy.indexOf('Remove-VM'));
 assert.doesNotMatch(hypervScripts.destroy, /-Name|Merge-VHD|Remove-Item/);
+
+const unattendedXml = createWindowsUnattendXml({ username: 'devuser' });
+assert.match(unattendedXml, /<WillWipeDisk>true<\/WillWipeDisk>/);
+assert.match(unattendedXml, /<DisableEncryptedDiskProvisioning>true<\/DisableEncryptedDiskProvisioning>/);
+assert.match(unattendedXml, /<HideOnlineAccountScreens>true<\/HideOnlineAccountScreens>/);
+assert.match(unattendedXml, /<HideWirelessSetupInOOBE>true<\/HideWirelessSetupInOOBE>/);
+assert.match(unattendedXml, /<ProtectYourPC>3<\/ProtectYourPC>/);
+assert.match(unattendedXml, /<Name>devuser<\/Name>/);
+assert.doesNotMatch(unattendedXml, /SkipMachineOOBE/);
+assert.throws(() => validateWindowsUsername('Administrator'), /reserved/);
+assert.throws(() => validateWindowsUsername('bad user'), /1-20/);
+const unattendedIso = createAnswerIsoBuffer(unattendedXml, new Date('2026-01-02T03:04:05Z'));
+assert.equal(unattendedIso.subarray(16 * 2048 + 1, 16 * 2048 + 6).toString('ascii'), 'CD001');
+assert.ok(unattendedIso.includes(Buffer.from('AUTOUNATTEND.XML;1', 'ascii')));
+assert.ok(unattendedIso.includes(Buffer.from('<unattend ', 'utf8')));
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-hyperv-smoke-'));
 const calls = [];
@@ -63,6 +81,7 @@ const executor = {
     const result = value => ({ stdout: JSON.stringify(value), stderr: '', exitCode: 0 });
     const error = message => ({ stdout: '', stderr: message, exitCode: 1 });
     if (operation === 'doctor') return result({ module: true, commands: true, service: true, hypervisor: true, permission: true, console: true });
+    if (operation === 'inspectIso') return result({ windows: path.basename(payload.iso).startsWith('windows-'), label: 'WINDOWS_TEST' });
     if (operation === 'import') {
       if (payload.source.includes('backed')) return error('Import requires a detached standalone VHD/VHDX without a parent.');
       await fs.writeFile(payload.destination, 'standalone VHDX test bytes');
@@ -71,6 +90,11 @@ const executor = {
     if (operation === 'disk') { await fs.writeFile(payload.disk, 'disposable VHDX bytes'); return result({ ok: true }); }
     if (operation === 'create') {
       const vmId = `00000000-0000-0000-0000-${String(++counter).padStart(12, '0')}`;
+      if (payload.unattendIso) {
+        const answer = await fs.readFile(payload.unattendIso);
+        assert.equal(answer.subarray(16 * 2048 + 1, 16 * 2048 + 6).toString('ascii'), 'CD001');
+        assert.ok(answer.includes(Buffer.from('AUTOUNATTEND.XML;1', 'ascii')));
+      }
       vms.set(vmId, { ownershipId: payload.ownershipId, state: 'Off', iso: payload.iso });
       await fs.writeFile(payload.journal, '\uFEFF' + JSON.stringify({ vmId, ownershipId: payload.ownershipId }));
       if (failTpm) return error('Virtual TPM could not be enabled.');
@@ -197,14 +221,41 @@ try {
   const installed = await manager.setupImage({ ...options, name: 'installed', sourcePath: iso, onProgress: message => progress.push(message) });
   assert.equal(installed.source.originalFileName, 'installer.iso.installed.vhdx');
   assert.equal(vms.size, 0); assert.equal((await manager.instances.list()).length, 0);
-  const isoCreate = calls.find(c => c.operation === 'create' && c.payload.iso);
+  const isoCreate = calls.find(c => c.operation === 'create' && c.payload.iso === iso);
   assert.equal(isoCreate.payload.iso, iso);
+  assert.equal(isoCreate.payload.unattendIso, undefined);
   assert.ok(calls.some(c => c.operation === 'console'));
   const installerCalls = calls.slice(installerCallsStart);
   assert.ok(!installerCalls.some(c => c.operation === 'start'), 'Interactive installer starts from VMConnect');
   assert.equal(installerCalls.filter(c => c.operation === 'status').length, 4, 'Initial Off must not promote an unbooted disk');
   assert.ok(progress.some(message => /Start/.test(message) && /Space/.test(message)));
   assert.equal(calls.find(c => c.operation === 'disk' && c.payload.size).payload.size, 64 * 1024 ** 3);
+
+  const windowsIso = path.join(root, 'windows-installer.iso'); await fs.writeFile(windowsIso, 'windows iso test bytes');
+  assert.deepEqual(await manager.inspectInstallerIso(windowsIso), { windows: true, label: 'WINDOWS_TEST' });
+  assert.deepEqual(await manager.inspectInstallerIso(iso), { windows: false, label: 'WINDOWS_TEST' });
+  await assert.rejects(
+    manager.setupImage({ ...options, name: 'not-windows', sourcePath: iso, windowsUnattend: { username: 'devuser' } }),
+    /not recognized as Windows/
+  );
+  const unattendedCallsStart = calls.length;
+  const unattendedProgress = [];
+  const automated = await manager.setupImage({
+    ...options,
+    name: 'installed-auto',
+    sourcePath: windowsIso,
+    windowsUnattend: { username: 'devuser' },
+    onProgress: message => unattendedProgress.push(message)
+  });
+  assert.equal(automated.source.originalFileName, 'windows-installer.iso.installed.vhdx');
+  assert.equal(vms.size, 0); assert.equal((await manager.instances.list()).length, 0);
+  const unattendedCalls = calls.slice(unattendedCallsStart);
+  const unattendedCreate = unattendedCalls.find(c => c.operation === 'create' && c.payload.iso === windowsIso);
+  assert.ok(unattendedCreate.payload.unattendIso.endsWith('unattend.iso'));
+  assert.equal(unattendedCreate.payload.secureBoot, 'windows');
+  assert.ok(unattendedProgress.some(message => /unattended setup/.test(message) && /devuser/.test(message)));
+  assert.equal(unattendedCalls.filter(c => c.operation === 'inspectIso').length, 1);
+  assert.ok(!unattendedCalls.some(c => c.operation === 'start'), 'Unattended Windows installer still starts from VMConnect to catch the DVD boot prompt');
   for (const ext of ['raw', 'qcow2']) {
     const unsupported = path.join(root, `source.${ext}`); await fs.writeFile(unsupported, 'unsupported');
     await assert.rejects(manager.setupImage({ ...options, name: ext, sourcePath: unsupported }), /Convert qcow2\/raw manually/);
@@ -228,6 +279,6 @@ try {
   console.log('Hyper-V smoke passed (selection, schemas, scripts, mocked import/ISO/lifecycle, ownership and failure recovery).');
 } finally {
   assert.equal(vms.size, 0, 'Mock VMs must be cleaned up');
-  for (const directory of ['native', 'installed', 'vhd']) await fs.chmod(path.join(root, 'store', 'images', directory, 'base.vhdx'), 0o600).catch(() => {});
+  for (const directory of ['native', 'installed', 'installed-auto', 'vhd']) await fs.chmod(path.join(root, 'store', 'images', directory, 'base.vhdx'), 0o600).catch(() => {});
   await fs.rm(root, { recursive: true, force: true });
 }

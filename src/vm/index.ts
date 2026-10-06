@@ -7,4 +7,5 @@ export * from "./guestAgent.js";
 export * from "./imageStore.js";
 export * from "./instanceStore.js";
 export * from "./vmManager.js";
+export * from "./backends/hyperv/windowsUnattend.js";
 export * from "./mcp.js";

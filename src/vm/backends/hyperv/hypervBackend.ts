@@ -10,6 +10,7 @@ import { configuredVmRoot, vmHomeLayout } from "../../vmHome.js";
 import { codexProHome } from "../../../profileStore.js";
 import type { VmBackend, DiskImporter } from "../backend.js";
 import { HypervPowerShell } from "./powershell.js";
+import { validateWindowsUsername, writeWindowsUnattendIso, type WindowsIsoInspection } from "./windowsUnattend.js";
 
 export function hypervState(state: string): VmInstanceState {
   if (state === "Running") return "running";
@@ -103,6 +104,14 @@ export class HypervBackend implements VmBackend {
     };
   }
 
+  async inspectInstallerIso(sourcePath: string): Promise<WindowsIsoInspection> {
+    const source = path.resolve(sourcePath);
+    if (path.extname(source).toLowerCase() !== ".iso") return { windows: false };
+    const stat = await fsp.stat(source).catch(() => undefined);
+    if (!stat?.isFile()) throw new Error("Installer ISO must be an existing regular file.");
+    return this.ps.run<WindowsIsoInspection>("inspectIso", { iso: source }, 60_000);
+  }
+
   async setupImage(options: SetupVmImageOptions): Promise<VmImageManifest> {
     validateImageName(options.name);
     validateResources(options.cpus, options.memoryMb);
@@ -146,11 +155,11 @@ export class HypervBackend implements VmBackend {
     return { vmId: validateVmGuid(journal.vmId), ownershipId: record.hyperv.ownershipId };
   }
 
-  private async createVm(record: VmInstanceRecord, disk: string, secureBoot: VmSecureBootMode, iso?: string): Promise<void> {
+  private async createVm(record: VmInstanceRecord, disk: string, secureBoot: VmSecureBootMode, iso?: string, unattendIso?: string): Promise<void> {
     const ownershipId = record.hyperv!.ownershipId;
     const result = await this.ps.run<{ vmId: string }>("create", {
       name: hypervName(record.id, ownershipId), ownershipId, cpus: record.cpus, memory: record.memoryMb * 1024 * 1024,
-      disk, iso, secureBoot, directory: record.instanceDir, journal: path.join(record.instanceDir, "hyperv-identity.json")
+      disk, iso, unattendIso, secureBoot, directory: record.instanceDir, journal: path.join(record.instanceDir, "hyperv-identity.json")
     }, 60_000);
     const vmId = validateVmGuid(result.vmId);
     await this.instances.update(record.id, { hyperv: { ownershipId, vmId }, state: iso ? "created" : "starting" });
@@ -178,10 +187,18 @@ export class HypervBackend implements VmBackend {
   private async installIso(options: SetupVmImageOptions, iso: string): Promise<VmImageManifest> {
     if (options.headless) throw new Error("Installer ISO setup requires an interactive Hyper-V console. Use a preinstalled VHD/VHDX with --headless.");
     if (!(await fsp.stat(iso)).isFile()) throw new Error("Installer ISO must be a regular file.");
+    if (options.windowsUnattend) {
+      validateWindowsUsername(options.windowsUnattend.username);
+      const inspection = await this.inspectInstallerIso(iso);
+      if (!inspection.windows) {
+        throw new Error("Windows unattended setup was requested, but the ISO was not recognized as Windows installation media.");
+      }
+    }
     const size = options.diskSizeGb ?? 64;
     if (!Number.isSafeInteger(size) || size < 4 || size > 2048) throw new Error("ISO installation disk size must be an integer from 4 to 2048 GiB.");
     const { record } = await this.allocate(options.name, options.cpus, options.memoryMb, options.desktop);
     const disk = path.join(record.instanceDir, "installed.vhdx");
+    const unattendIso = options.windowsUnattend ? path.join(record.instanceDir, "unattend.iso") : undefined;
     let interrupted = false;
     const interrupt = () => { interrupted = true; };
     process.on("SIGINT", interrupt); process.on("SIGTERM", interrupt);
@@ -189,9 +206,16 @@ export class HypervBackend implements VmBackend {
       const manifest = await this.lock(record, async () => {
         try {
           await this.ps.run("disk", { disk, size: size * 1024 ** 3 });
-          await this.createVm(record, disk, options.secureBoot ?? "off", iso);
+          if (unattendIso && options.windowsUnattend) {
+            await writeWindowsUnattendIso(unattendIso, options.windowsUnattend);
+          }
+          await this.createVm(record, disk, options.secureBoot ?? "off", iso, unattendIso);
           const identity = await this.identity(await this.instances.read(record.id));
-          options.onProgress?.(`Installer ${record.id} (${identity.vmId}). In VMConnect, click Start (Avvia), focus the guest display and immediately press Space when prompted to boot from CD/DVD. If the UEFI boot summary appears, click Restart now and press Space immediately. Complete installation, then shut down the guest. Network is disconnected. Setup expires after 4 hours; failed disks are retained.`);
+          if (options.windowsUnattend) {
+            options.onProgress?.(`Windows installer ${record.id} (${identity.vmId}) is prepared for unattended setup. In VMConnect, click Start (Avvia), focus the guest display and immediately press Space when prompted to boot from CD/DVD. CodexPro will wipe only this newly created VM disk, partition it, skip Microsoft-account/network/privacy OOBE pages, and create local Administrator "${options.windowsUnattend.username}". If the source ISO contains multiple Windows editions, Setup may still ask you to choose one. The account starts with a blank password and Windows will require changing it at first sign-in. Shut down the guest when installation is complete. Network is disconnected. Setup expires after 4 hours; failed disks are retained.`);
+          } else {
+            options.onProgress?.(`Installer ${record.id} (${identity.vmId}). In VMConnect, click Start (Avvia), focus the guest display and immediately press Space when prompted to boot from CD/DVD. If the UEFI boot summary appears, click Restart now and press Space immediately. Complete installation, then shut down the guest. Network is disconnected. Setup expires after 4 hours; failed disks are retained.`);
+          }
           await this.ps.run("console", identity);
           const deadline = Date.now() + 4 * 60 * 60_000;
           let started = false;

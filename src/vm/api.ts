@@ -21,6 +21,8 @@ export interface SetupVmImageOptions {
   desktop: boolean;
   /** Hyper-V only: off, Microsoft Windows, or Microsoft UEFI CA. */
   secureBoot?: VmSecureBootMode;
+  /** Hyper-V Windows installer only: generate a removable Autounattend.xml answer disk. */
+  windowsUnattend?: { username: string };
   validate?: boolean;
   diskSizeGb?: number;
   headless?: boolean;

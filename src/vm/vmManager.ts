@@ -39,6 +39,10 @@ export class VmManager {
 
   doctor(architecture?: VmArchitecture) { return this.runtime.doctor(architecture); }
   setupImage(options: SetupVmImageOptions) { return this.runtime.setupImage(options); }
+  inspectInstallerIso(sourcePath: string) {
+    if (this.runtime instanceof HypervBackend) return this.runtime.inspectInstallerIso(sourcePath);
+    return Promise.resolve({ windows: false });
+  }
   createInstance(image: string, options?: CreateVmOptions) { return this.runtime.createInstance(image, options); }
   status(id: string) { return this.runtime.status(id); }
   listInstances() { return this.runtime.listInstances(); }

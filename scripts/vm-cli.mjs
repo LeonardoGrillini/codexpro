@@ -4,8 +4,8 @@ import process from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import { pathToFileURL } from 'node:url';
 
-const BOOLEAN_OPTIONS = new Set(['desktop', 'no-desktop', 'validate', 'no-validate', 'headless', 'help']);
-const VALUE_OPTIONS = new Set(['name', 'image', 'architecture', 'arch', 'cpus', 'memory', 'disk-size', 'secure-boot', 'vm-home', 'qemu', 'qemu-img']);
+const BOOLEAN_OPTIONS = new Set(['desktop', 'no-desktop', 'validate', 'no-validate', 'windows-unattend', 'no-windows-unattend', 'headless', 'help']);
+const VALUE_OPTIONS = new Set(['name', 'image', 'architecture', 'arch', 'cpus', 'memory', 'disk-size', 'secure-boot', 'windows-user', 'vm-home', 'qemu', 'qemu-img']);
 
 function parseVmArgs(argv) {
   const out = { positional: [] };
@@ -23,6 +23,7 @@ function parseVmArgs(argv) {
       if (inline !== undefined) throw new Error(`--${key} does not take a value.`);
       if (key === 'no-desktop') out.desktop = false;
       else if (key === 'no-validate') out.validate = false;
+      else if (key === 'no-windows-unattend') out.windowsUnattend = false;
       else out[key.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = true;
       continue;
     }
@@ -130,7 +131,10 @@ Setup options:
   --cpus <n>                 Default virtual CPUs.
   --memory <MiB>             Default memory in MiB.
   --disk-size <GiB>          Target disk size for ISO installation. Default: 64 GiB.
-  --secure-boot <mode>       Hyper-V only: off, windows, or uefi-ca. Default: off.
+  --secure-boot <mode>       Hyper-V only: off, windows, or uefi-ca. Windows media defaults to windows.
+  --windows-unattend         For detected Windows ISO media, automate disk setup and OOBE.
+  --no-windows-unattend      Keep the normal interactive Windows setup.
+  --windows-user <name>      Local Administrator name; implies --windows-unattend.
   --vm-home <dir>            VM storage root. Setup remembers the selected location.
   --desktop                  Mark the image as providing a desktop environment.
   --validate                 Perform a bounded validation boot (QGA probe on QEMU only).
@@ -180,7 +184,7 @@ async function setupCommand(runtime, args) {
       if (path.extname(expandUserPath(image)).toLowerCase() === '.iso') {
         diskSize = await ask(rl, 'Installation disk size (GiB)', diskSize ?? defaultDiskSize);
       }
-      if (process.platform === 'win32') {
+      if (process.platform === 'win32' && path.extname(expandUserPath(image)).toLowerCase() !== '.iso') {
         secureBoot = await ask(rl, 'Hyper-V Secure Boot mode (off/windows/uefi-ca)', secureBoot ?? 'off');
       }
       vmHome = await ask(rl, 'VM storage location', vmHome);
@@ -198,6 +202,13 @@ async function setupCommand(runtime, args) {
   const isInstallerIso = path.extname(resolvedImage).toLowerCase() === '.iso';
   const resolvedVmHome = path.resolve(expandUserPath(vmHome));
   if (process.platform !== 'win32' && secureBoot !== undefined) throw new Error('--secure-boot is supported only by the Windows Hyper-V backend.');
+  if (args.windowsUser !== undefined && args.windowsUnattend === false) throw new Error('--windows-user cannot be combined with --no-windows-unattend.');
+  if (process.platform !== 'win32' && (args.windowsUnattend !== undefined || args.windowsUser !== undefined)) {
+    throw new Error('Windows unattended setup is supported only by the Windows Hyper-V backend.');
+  }
+  if (!isInstallerIso && (args.windowsUnattend === true || args.windowsUser !== undefined)) {
+    throw new Error('--windows-unattend/--windows-user require a Windows installer ISO.');
+  }
   if (isInstallerIso && !args.headless) {
     console.log('\nInstaller ISO detected. CodexPro will create a blank disk and open the native VM console.');
     console.log('Complete the OS installation in the VM console, then shut the VM down to finish importing the disk.\n');
@@ -209,6 +220,66 @@ async function setupCommand(runtime, args) {
   });
 
   await runtime.saveConfiguredVmRoot(resolvedVmHome);
+
+  let windowsInstaller = false;
+  let windowsUnattend;
+  if (process.platform === 'win32' && isInstallerIso) {
+    let inspection;
+    try {
+      inspection = await manager.inspectInstallerIso(resolvedImage);
+    } catch (error) {
+      if (args.windowsUnattend === true || args.windowsUser !== undefined) {
+        throw new Error(`Windows unattended setup requires readable Windows installation media: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      console.log(`Windows media detection unavailable; continuing with normal interactive ISO setup: ${error instanceof Error ? error.message : String(error)}`);
+      inspection = { windows: false };
+    }
+    windowsInstaller = Boolean(inspection.windows);
+    if (windowsInstaller) {
+      console.log(`\nWindows installation media detected${inspection.label ? ` (${inspection.label})` : ''}.`);
+      if (secureBoot === undefined) {
+        secureBoot = 'windows';
+        console.log('Hyper-V Secure Boot will use the Microsoft Windows template.');
+      }
+
+      let automateWindows = args.windowsUnattend;
+      if (args.windowsUser !== undefined) automateWindows = true;
+      if (automateWindows === undefined && !args.headless && process.stdin.isTTY) {
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        try {
+          automateWindows = await askBoolean(
+            rl,
+            'Automate Windows setup (wipe the new VM disk, skip Microsoft-account/network/privacy OOBE, and create a local Administrator account)?',
+            false
+          );
+        } finally {
+          rl.close();
+        }
+      }
+
+      if (automateWindows) {
+        let windowsUser = args.windowsUser ?? runtime.suggestWindowsUsername(os.userInfo().username);
+        if (args.windowsUser === undefined && !args.headless && process.stdin.isTTY) {
+          const rl = createInterface({ input: process.stdin, output: process.stdout });
+          try {
+            windowsUser = await ask(rl, 'Local Windows Administrator account name', windowsUser);
+          } finally {
+            rl.close();
+          }
+        }
+        windowsUser = runtime.validateWindowsUsername(String(windowsUser));
+        windowsUnattend = { username: windowsUser };
+        console.log(`Windows unattended setup enabled for local Administrator "${windowsUser}".`);
+        console.log('The original Windows ISO will not be modified; CodexPro attaches a separate answer-file DVD.');
+        console.log('If the ISO contains multiple Windows editions, the edition chooser may still appear.\n');
+      } else {
+        console.log('Windows setup will remain interactive.\n');
+      }
+    } else if (args.windowsUnattend || args.windowsUser !== undefined) {
+      throw new Error('--windows-unattend/--windows-user were requested, but the ISO was not recognized as Windows installation media.');
+    }
+  }
+
   const manifest = await manager.setupImage({
     name,
     sourcePath: resolvedImage,
@@ -216,7 +287,8 @@ async function setupCommand(runtime, args) {
     cpus: positiveInteger(cpus, '--cpus', defaultCpus),
     memoryMb: positiveInteger(memory, '--memory', defaultMemory),
     desktop: Boolean(desktop),
-    ...(process.platform === 'win32' ? { secureBoot: secureBootMode(secureBoot) } : {}),
+    ...(process.platform === 'win32' ? { secureBoot: secureBootMode(secureBoot, windowsInstaller ? 'windows' : 'off') } : {}),
+    ...(windowsUnattend ? { windowsUnattend } : {}),
     validate: Boolean(validate),
     diskSizeGb: positiveInteger(diskSize, '--disk-size', defaultDiskSize),
     headless: Boolean(args.headless),

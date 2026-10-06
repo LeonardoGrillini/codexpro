@@ -14,7 +14,7 @@ $commands = $false; $service = $false; $hypervisor = $false; $permission = $fals
 if ($module) {
   Import-Module Hyper-V
   $commands = $true
-  foreach ($name in @('New-VM','Get-VM','Set-VM','Set-VMProcessor','Set-VMFirmware','Set-VMKeyProtector','Get-VMKeyProtector','Enable-VMTPM','Get-VMSecurity','Add-VMDvdDrive','Get-VMHardDiskDrive','Get-VMNetworkAdapter','Disconnect-VMNetworkAdapter','Start-VM','Stop-VM','Remove-VM','New-VHD','Get-VHD','Convert-VHD','Test-VHD')) {
+  foreach ($name in @('New-VM','Get-VM','Set-VM','Set-VMProcessor','Set-VMFirmware','Set-VMKeyProtector','Get-VMKeyProtector','Enable-VMTPM','Get-VMSecurity','Add-VMDvdDrive','Get-VMHardDiskDrive','Get-VMNetworkAdapter','Disconnect-VMNetworkAdapter','Start-VM','Stop-VM','Remove-VM','New-VHD','Get-VHD','Convert-VHD','Test-VHD','Get-DiskImage','Mount-DiskImage','Dismount-DiskImage','Get-Volume')) {
     if (!(Get-Command $name -ErrorAction SilentlyContinue)) { $commands = $false }
   }
 }
@@ -25,6 +25,21 @@ $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.
 $permission = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -or $principal.IsInRole([Security.Principal.SecurityIdentifier]'S-1-5-32-578')
 if ($permission -and $module) { try { Get-VMHost | Out-Null } catch { $permission = $false } }
 @{ module=$module; commands=$commands; service=$service; hypervisor=$hypervisor; permission=$permission; console=[bool](Get-Command vmconnect.exe -ErrorAction SilentlyContinue) } | ConvertTo-Json -Compress
+`,
+  inspectIso: `
+$image = Get-DiskImage -ImagePath $p.iso -ErrorAction Stop
+$wasAttached = [bool]$image.Attached
+try {
+  if (!$wasAttached) { $image = Mount-DiskImage -ImagePath $p.iso -PassThru -ErrorAction Stop }
+  $volume = @($image | Get-Volume -ErrorAction Stop | Where-Object { $_.DriveLetter }) | Select-Object -First 1
+  if ($null -eq $volume) { throw 'Mounted ISO has no readable volume.' }
+  $root = $volume.DriveLetter + ':\\'
+  $hasSetup = Test-Path -LiteralPath (Join-Path $root 'setup.exe') -PathType Leaf
+  $hasInstallImage = (Test-Path -LiteralPath (Join-Path $root 'sources\\install.wim') -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $root 'sources\\install.esd') -PathType Leaf) -or (Test-Path -Path (Join-Path $root 'sources\\install*.swm') -PathType Leaf)
+  @{ windows=[bool]($hasSetup -and $hasInstallImage); label=[string]$volume.FileSystemLabel } | ConvertTo-Json -Compress
+} finally {
+  if (!$wasAttached) { Dismount-DiskImage -ImagePath $p.iso -ErrorAction SilentlyContinue | Out-Null }
+}
 `,
   import: `
 $disk = Get-VHD -Path $p.source
@@ -60,6 +75,7 @@ if ($p.secureBoot -eq 'windows') {
 }
 if ($p.iso) {
   $dvd = Add-VMDvdDrive -VM $vm -Path $p.iso -Passthru
+  if ($p.unattendIso) { Add-VMDvdDrive -VM $vm -Path $p.unattendIso | Out-Null }
   Set-VMFirmware -VM $vm -FirstBootDevice $dvd
 } else {
   $drive = Get-VMHardDiskDrive -VM $vm | Select-Object -First 1
